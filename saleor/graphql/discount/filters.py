@@ -8,7 +8,7 @@ from ...discount import DiscountValueType
 from ...discount.models import Sale, Voucher, VoucherQueryset
 from ..core.filters import ListObjectTypeFilter, ObjectTypeFilter
 from ..core.types.common import DateTimeRangeInput, IntRangeInput
-from ..utils import filter_by_query_param
+from ..utils.filters import filter_by_query_param, filter_range_field
 from .enums import DiscountStatusEnum, DiscountValueTypeEnum, VoucherDiscountType
 
 
@@ -29,13 +29,7 @@ def filter_status(
 
 
 def filter_times_used(qs, _, value):
-    gte = value.get("gte")
-    lte = value.get("lte")
-    if gte:
-        qs = qs.filter(used__gte=gte)
-    if lte:
-        qs = qs.filter(used__lte=lte)
-    return qs
+    return filter_range_field(qs, "used", value)
 
 
 def filter_discount_type(
@@ -58,13 +52,7 @@ def filter_discount_type(
 
 
 def filter_started(qs, _, value):
-    gte = value.get("gte")
-    lte = value.get("lte")
-    if gte:
-        qs = qs.filter(start_date__gte=gte)
-    if lte:
-        qs = qs.filter(start_date__lte=lte)
-    return qs
+    return filter_range_field(qs, "start_date", value)
 
 
 def filter_sale_type(qs, _, value):
@@ -74,7 +62,7 @@ def filter_sale_type(qs, _, value):
 
 
 def filter_sale_search(qs, _, value):
-    search_fields = ("name", "value", "type")
+    search_fields = ("name", "channel_listings__discount_value", "type")
     if value:
         qs = filter_by_query_param(qs, value, search_fields)
     return qs

@@ -1,17 +1,16 @@
+import json
 from functools import partial
 
 import graphene
-from django.db.models.query import QuerySet
-from django_measurement.models import MeasurementField
-from django_prices.models import MoneyField, TaxedMoneyField
 from graphene.relay import PageInfo
-from graphene_django.converter import convert_django_field
 from graphene_django.fields import DjangoConnectionField
+from graphql.error import GraphQLError
 from graphql_relay.connection.arrayconnection import connection_from_list_slice
 from promise import Promise
 
-from .types.common import Weight
-from .types.money import Money, TaxedMoney
+from ..channel import ChannelContext, ChannelQsContext
+from ..utils.sorting import sort_queryset_for_connection
+from .connection import connection_from_queryset_slice
 
 
 def patch_pagination_args(field: DjangoConnectionField):
@@ -41,24 +40,36 @@ class BaseConnectionField(graphene.ConnectionField):
 
 
 class BaseDjangoConnectionField(DjangoConnectionField):
+    @classmethod
+    def resolve_connection(cls, connection, args, iterable, max_limit=None):
+        common_args = {
+            "connection_type": connection,
+            "edge_type": connection.Edge,
+            "pageinfo_type": PageInfo,
+        }
+        if isinstance(iterable, list):
+            common_args["args"] = args
+            _len = len(iterable)
+            connection = connection_from_list_slice(
+                iterable,
+                slice_start=0,
+                list_length=_len,
+                list_slice_length=_len,
+                **common_args,
+            )
+        else:
+            iterable, sort_by = sort_queryset_for_connection(
+                iterable=iterable, args=args
+            )
+            args["sort_by"] = sort_by
+            common_args["args"] = args
+            connection = connection_from_queryset_slice(iterable, **common_args)
+        connection.iterable = iterable
+        return connection
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         patch_pagination_args(self)
-
-
-@convert_django_field.register(TaxedMoneyField)
-def convert_field_taxed_money(*_args):
-    return graphene.Field(TaxedMoney)
-
-
-@convert_django_field.register(MoneyField)
-def convert_field_money(*_args):
-    return graphene.Field(Money)
-
-
-@convert_django_field.register(MeasurementField)
-def convert_field_measurements(*_args):
-    return graphene.Field(Weight)
 
 
 class PrefetchingConnectionField(BaseDjangoConnectionField):
@@ -68,6 +79,7 @@ class PrefetchingConnectionField(BaseDjangoConnectionField):
         resolver,
         connection,
         default_manager,
+        queryset_resolver,
         max_limit,
         enforce_first_or_last,
         root,
@@ -86,36 +98,13 @@ class PrefetchingConnectionField(BaseDjangoConnectionField):
             resolver,
             connection,
             default_manager,
+            queryset_resolver,
             max_limit,
             enforce_first_or_last,
             root,
             info,
             **args,
         )
-
-    @classmethod
-    def resolve_connection(cls, connection, default_manager, args, iterable):
-        if iterable is None:
-            iterable = default_manager
-
-        if isinstance(iterable, QuerySet):
-            _len = iterable.count()
-        else:
-            _len = len(iterable)
-
-        connection = connection_from_list_slice(
-            iterable,
-            args,
-            slice_start=0,
-            list_length=_len,
-            list_slice_length=_len,
-            connection_type=connection,
-            edge_type=connection.Edge,
-            pageinfo_type=PageInfo,
-        )
-        connection.iterable = iterable
-        connection.length = _len
-        return connection
 
 
 class FilterInputConnectionField(BaseDjangoConnectionField):
@@ -133,6 +122,7 @@ class FilterInputConnectionField(BaseDjangoConnectionField):
         resolver,
         connection,
         default_manager,
+        queryset_resolver,
         max_limit,
         enforce_first_or_last,
         filterset_class,
@@ -141,7 +131,6 @@ class FilterInputConnectionField(BaseDjangoConnectionField):
         info,
         **args,
     ):
-
         # Disable `enforce_first_or_last` if not querying for `edges`.
         values = [
             field.name.value for field in info.field_asts[0].selection_set.selections
@@ -152,11 +141,11 @@ class FilterInputConnectionField(BaseDjangoConnectionField):
         first = args.get("first")
         last = args.get("last")
 
-        if enforce_first_or_last:
-            assert first or last, (
-                "You must provide a `first` or `last` value to properly "
-                "paginate the `{}` connection."
-            ).format(info.field_name)
+        if enforce_first_or_last and not (first or last):
+            raise GraphQLError(
+                f"You must provide a `first` or `last` value to properly paginate "
+                f"the `{info.field_name}` connection."
+            )
 
         if max_limit:
             if first:
@@ -175,17 +164,36 @@ class FilterInputConnectionField(BaseDjangoConnectionField):
 
         iterable = resolver(root, info, **args)
 
-        on_resolve = partial(cls.resolve_connection, connection, default_manager, args)
+        if iterable is None:
+            iterable = default_manager
+        # thus the iterable gets refiltered by resolve_queryset
+        # but iterable might be promise
+        iterable = queryset_resolver(connection, iterable, info, args)
 
-        filter_input = args.get(filters_name)
-        if filter_input and filterset_class:
-            iterable = filterset_class(
-                data=dict(filter_input), queryset=iterable, request=info.context
-            ).qs
+        on_resolve = partial(
+            cls.resolve_connection, connection, args, max_limit=max_limit
+        )
+
+        iterable = cls.filter_iterable(
+            iterable, filterset_class, filters_name, info, **args
+        )
 
         if Promise.is_thenable(iterable):
             return Promise.resolve(iterable).then(on_resolve)
         return on_resolve(iterable)
+
+    @classmethod
+    def filter_iterable(cls, iterable, filterset_class, filters_name, info, **args):
+        filter_input = args.get(filters_name)
+        if filter_input and filterset_class:
+            instance = filterset_class(
+                data=dict(filter_input), queryset=iterable, request=info.context
+            )
+            # Make sure filter input has valid values
+            if not instance.is_valid():
+                raise GraphQLError(json.dumps(instance.errors.get_json_data()))
+            iterable = instance.qs
+        return iterable
 
     def get_resolver(self, parent_resolver):
         return partial(
@@ -193,3 +201,30 @@ class FilterInputConnectionField(BaseDjangoConnectionField):
             self.filterset_class,
             self.filter_field_name,
         )
+
+
+class ChannelContextFilterConnectionField(FilterInputConnectionField):
+    @classmethod
+    def filter_iterable(cls, iterable, filterset_class, filters_name, info, **args):
+        # Overriding filter_iterable to unpack the queryset from iterable, which is
+        # an instance of ChannelQsContext and pack it back after filtering is done.
+        channel_slug = iterable.channel_slug
+        iterable = super().filter_iterable(
+            iterable.qs, filterset_class, filters_name, info, **args
+        )
+        return ChannelQsContext(qs=iterable, channel_slug=channel_slug)
+
+    @classmethod
+    def resolve_connection(
+        cls, connection, args, iterable: ChannelQsContext, max_limit=None
+    ):
+        connection = super().resolve_connection(
+            connection, args, iterable.qs, max_limit
+        )
+        edges_with_context = []
+        for edge in connection.edges:
+            node = edge.node
+            edge.node = ChannelContext(node=node, channel_slug=iterable.channel_slug)
+            edges_with_context.append(edge)
+        connection.edges = edges_with_context
+        return connection

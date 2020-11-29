@@ -1,3 +1,5 @@
+from typing import Optional
+
 import graphene
 from django.conf import settings
 from django.utils import translation
@@ -8,16 +10,17 @@ from phonenumbers import COUNTRY_CODE_TO_REGION_CODE
 from ...account import models as account_models
 from ...core.permissions import SitePermissions, get_permissions
 from ...core.utils import get_client_ip, get_country_by_ip
-from ...menu import models as menu_models
-from ...product import models as product_models
+from ...plugins.manager import get_plugins_manager
 from ...site import models as site_models
 from ..account.types import Address, StaffNotificationRecipient
+from ..channel import ChannelContext
+from ..checkout.types import PaymentGateway
 from ..core.enums import WeightUnitsEnum
-from ..core.types.common import CountryDisplay, LanguageDisplay, PermissionDisplay
-from ..core.utils import get_node_optimized, str_to_enum
+from ..core.types.common import CountryDisplay, LanguageDisplay, Permission
+from ..core.utils import str_to_enum
 from ..decorators import permission_required
+from ..menu.dataloaders import MenuByIdLoader
 from ..menu.types import Menu
-from ..product.types import Collection
 from ..translations.enums import LanguageCodeEnum
 from ..translations.fields import TranslationField
 from ..translations.resolvers import resolve_translation
@@ -62,6 +65,16 @@ class Geolocalization(graphene.ObjectType):
 
 
 class Shop(graphene.ObjectType):
+    available_payment_gateways = graphene.List(
+        graphene.NonNull(PaymentGateway),
+        currency=graphene.Argument(
+            graphene.String,
+            description="A currency for which gateways will be returned.",
+            required=False,
+        ),
+        description="List of available payment gateways.",
+        required=True,
+    )
     geolocalization = graphene.Field(
         Geolocalization, description="Customer's geolocalization data."
     )
@@ -74,19 +87,13 @@ class Shop(graphene.ObjectType):
         required=True,
     )
     countries = graphene.List(
-        CountryDisplay,
+        graphene.NonNull(CountryDisplay),
         language_code=graphene.Argument(
             LanguageCodeEnum,
             description="A language code to return the translation for.",
         ),
         description="List of countries available in the shop.",
         required=True,
-    )
-    currencies = graphene.List(
-        graphene.String, description="List of available currencies.", required=True
-    )
-    default_currency = graphene.String(
-        description="Shop's default currency.", required=True
     )
     default_country = graphene.Field(
         CountryDisplay, description="Shop's default country."
@@ -99,18 +106,19 @@ class Shop(graphene.ObjectType):
     )
     description = graphene.String(description="Shop's description.")
     domain = graphene.Field(Domain, required=True, description="Shop's domain data.")
-    homepage_collection = graphene.Field(
-        Collection, description="Collection displayed on homepage."
-    )
     languages = graphene.List(
         LanguageDisplay,
         description="List of the shops's supported languages.",
         required=True,
     )
     name = graphene.String(description="Shop's name.", required=True)
-    navigation = graphene.Field(Navigation, description="Shop's navigation.")
+    navigation = graphene.Field(
+        Navigation,
+        description="Shop's navigation.",
+        deprecation_reason="Fetch menus using the `menu` query with `slug` parameter.",
+    )
     permissions = graphene.List(
-        PermissionDisplay, description="List of available permissions.", required=True
+        Permission, description="List of available permissions.", required=True
     )
     phone_prefixes = graphene.List(
         graphene.String, description="List of possible phone prefixes.", required=True
@@ -159,6 +167,10 @@ class Shop(graphene.ObjectType):
         )
 
     @staticmethod
+    def resolve_available_payment_gateways(_, _info, currency: Optional[str] = None):
+        return get_plugins_manager().list_payment_gateways(currency=currency)
+
+    @staticmethod
     @permission_required(SitePermissions.MANAGE_SETTINGS)
     def resolve_authorization_keys(_, _info):
         return site_models.AuthorizationKey.objects.all()
@@ -173,10 +185,6 @@ class Shop(graphene.ObjectType):
                 )
                 for country in countries
             ]
-
-    @staticmethod
-    def resolve_currencies(_, _info):
-        return settings.AVAILABLE_CURRENCIES
 
     @staticmethod
     def resolve_domain(_, info):
@@ -198,18 +206,8 @@ class Shop(graphene.ObjectType):
         return Geolocalization(country=None)
 
     @staticmethod
-    def resolve_default_currency(_, _info):
-        return settings.DEFAULT_CURRENCY
-
-    @staticmethod
     def resolve_description(_, info):
         return info.context.site.settings.description
-
-    @staticmethod
-    def resolve_homepage_collection(_, info):
-        collection_pk = info.context.site.settings.homepage_collection_id
-        qs = product_models.Collection.objects.all()
-        return get_node_optimized(qs, {"pk": collection_pk}, info)
 
     @staticmethod
     def resolve_languages(_, _info):
@@ -227,10 +225,22 @@ class Shop(graphene.ObjectType):
     @staticmethod
     def resolve_navigation(_, info):
         site_settings = info.context.site.settings
-        qs = menu_models.Menu.objects.all()
-        top_menu = get_node_optimized(qs, {"pk": site_settings.top_menu_id}, info)
-        bottom_menu = get_node_optimized(qs, {"pk": site_settings.bottom_menu_id}, info)
-        return Navigation(main=top_menu, secondary=bottom_menu)
+        main = None
+        if site_settings.top_menu_id:
+            main = (
+                MenuByIdLoader(info.context)
+                .load(site_settings.top_menu_id)
+                .then(lambda menu: ChannelContext(node=menu, channel_slug=None))
+            )
+        secondary = None
+        if site_settings.bottom_menu_id:
+            secondary = (
+                MenuByIdLoader(info.context)
+                .load(site_settings.bottom_menu_id)
+                .then(lambda menu: ChannelContext(node=menu, channel_slug=None))
+            )
+
+        return Navigation(main=main, secondary=secondary)
 
     @staticmethod
     def resolve_permissions(_, _info):

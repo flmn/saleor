@@ -1,12 +1,18 @@
 import graphene
+from django.core.exceptions import ValidationError
 
+from ...attribute import models as attribute_models
 from ...core.permissions import SitePermissions
 from ...discount import models as discount_models
 from ...menu import models as menu_models
 from ...page import models as page_models
 from ...product import models as product_models
 from ...shipping import models as shipping_models
+from ..channel import ChannelContext
 from ..core.mutations import BaseMutation, ModelMutation, registry
+from ..core.types.common import TranslationError
+from ..core.utils import from_global_id_strict_type
+from ..product.types import Product, ProductVariant
 from ..shop.types import Shop
 from .enums import LanguageCodeEnum
 
@@ -24,6 +30,11 @@ class BaseTranslateMutation(ModelMutation):
 
     @classmethod
     def perform_mutation(cls, _root, info, **data):
+        if "id" in data and not data["id"]:
+            raise ValidationError(
+                {"id": ValidationError("This field is required", code="required")}
+            )
+
         model_type = registry.get_type_for_model(cls._meta.model)
         instance = cls.get_node_or_error(info, data["id"], only_type=model_type)
         instance.translations.update_or_create(
@@ -57,6 +68,8 @@ class CategoryTranslate(BaseTranslateMutation):
     class Meta:
         description = "Creates/Updates translations for Category."
         model = product_models.Category
+        error_type_class = TranslationError
+        error_type_field = "translation_errors"
 
 
 class ProductTranslate(BaseTranslateMutation):
@@ -70,6 +83,23 @@ class ProductTranslate(BaseTranslateMutation):
     class Meta:
         description = "Creates/Updates translations for Product."
         model = product_models.Product
+        error_type_class = TranslationError
+        error_type_field = "translation_errors"
+
+    @classmethod
+    def perform_mutation(cls, _root, info, **data):
+        if "id" in data and not data["id"]:
+            raise ValidationError(
+                {"id": ValidationError("This field is required", code="required")}
+            )
+
+        product_pk = from_global_id_strict_type(data["id"], Product, field="id")
+        product = product_models.Product.objects.get(pk=product_pk)
+        product.translations.update_or_create(
+            language_code=data["language_code"], defaults=data["input"]
+        )
+        product = ChannelContext(node=product, channel_slug=None)
+        return cls(**{cls._meta.return_field_name: product})
 
 
 class CollectionTranslate(BaseTranslateMutation):
@@ -83,6 +113,14 @@ class CollectionTranslate(BaseTranslateMutation):
     class Meta:
         description = "Creates/Updates translations for collection."
         model = product_models.Collection
+        error_type_class = TranslationError
+        error_type_field = "translation_errors"
+
+    @classmethod
+    def perform_mutation(cls, _root, info, **data):
+        response = super().perform_mutation(_root, info, **data)
+        instance = ChannelContext(node=response.collection, channel_slug=None)
+        return cls(**{cls._meta.return_field_name: instance})
 
 
 class ProductVariantTranslate(BaseTranslateMutation):
@@ -96,6 +134,23 @@ class ProductVariantTranslate(BaseTranslateMutation):
     class Meta:
         description = "Creates/Updates translations for Product Variant."
         model = product_models.ProductVariant
+        error_type_class = TranslationError
+        error_type_field = "translation_errors"
+
+    @classmethod
+    def perform_mutation(cls, _root, info, **data):
+        if "id" in data and not data["id"]:
+            raise ValidationError(
+                {"id": ValidationError("This field is required", code="required")}
+            )
+
+        variant_pk = from_global_id_strict_type(data["id"], ProductVariant, field="id")
+        variant = product_models.ProductVariant.objects.get(pk=variant_pk)
+        variant.translations.update_or_create(
+            language_code=data["language_code"], defaults=data["input"]
+        )
+        variant = ChannelContext(node=variant, channel_slug=None)
+        return cls(**{cls._meta.return_field_name: variant})
 
 
 class AttributeTranslate(BaseTranslateMutation):
@@ -108,7 +163,9 @@ class AttributeTranslate(BaseTranslateMutation):
 
     class Meta:
         description = "Creates/Updates translations for attribute."
-        model = product_models.Attribute
+        model = attribute_models.Attribute
+        error_type_class = TranslationError
+        error_type_field = "translation_errors"
 
 
 class AttributeValueTranslate(BaseTranslateMutation):
@@ -121,7 +178,9 @@ class AttributeValueTranslate(BaseTranslateMutation):
 
     class Meta:
         description = "Creates/Updates translations for attribute value."
-        model = product_models.AttributeValue
+        model = attribute_models.AttributeValue
+        error_type_class = TranslationError
+        error_type_field = "translation_errors"
 
 
 class SaleTranslate(BaseTranslateMutation):
@@ -135,6 +194,14 @@ class SaleTranslate(BaseTranslateMutation):
     class Meta:
         description = "Creates/updates translations for a sale."
         model = discount_models.Sale
+        error_type_class = TranslationError
+        error_type_field = "translation_errors"
+
+    @classmethod
+    def perform_mutation(cls, _root, info, **data):
+        response = super().perform_mutation(_root, info, **data)
+        instance = ChannelContext(node=response.sale, channel_slug=None)
+        return cls(**{cls._meta.return_field_name: instance})
 
 
 class VoucherTranslate(BaseTranslateMutation):
@@ -148,6 +215,14 @@ class VoucherTranslate(BaseTranslateMutation):
     class Meta:
         description = "Creates/Updates translations for Voucher."
         model = discount_models.Voucher
+        error_type_class = TranslationError
+        error_type_field = "translation_errors"
+
+    @classmethod
+    def perform_mutation(cls, _root, info, **data):
+        response = super().perform_mutation(_root, info, **data)
+        instance = ChannelContext(node=response.voucher, channel_slug=None)
+        return cls(**{cls._meta.return_field_name: instance})
 
 
 class ShippingPriceTranslate(BaseTranslateMutation):
@@ -161,6 +236,14 @@ class ShippingPriceTranslate(BaseTranslateMutation):
     class Meta:
         description = "Creates/Updates translations for shipping method."
         model = shipping_models.ShippingMethod
+        error_type_class = TranslationError
+        error_type_field = "translation_errors"
+
+    @classmethod
+    def perform_mutation(cls, _root, info, **data):
+        response = super().perform_mutation(_root, info, **data)
+        instance = ChannelContext(node=response.shippingMethod, channel_slug=None)
+        return cls(**{cls._meta.return_field_name: instance})
 
 
 class MenuItemTranslate(BaseTranslateMutation):
@@ -174,6 +257,14 @@ class MenuItemTranslate(BaseTranslateMutation):
     class Meta:
         description = "Creates/Updates translations for Menu Item."
         model = menu_models.MenuItem
+        error_type_class = TranslationError
+        error_type_field = "translation_errors"
+
+    @classmethod
+    def perform_mutation(cls, _root, info, **data):
+        response = super().perform_mutation(_root, info, **data)
+        instance = ChannelContext(node=response.menuItem, channel_slug=None)
+        return cls(**{cls._meta.return_field_name: instance})
 
 
 class PageTranslationInput(SeoTranslationInput):
@@ -193,6 +284,8 @@ class PageTranslate(BaseTranslateMutation):
     class Meta:
         description = "Creates/Updates translations for Page."
         model = page_models.Page
+        error_type_class = TranslationError
+        error_type_field = "translation_errors"
 
 
 class ShopSettingsTranslationInput(graphene.InputObjectType):
@@ -215,6 +308,8 @@ class ShopSettingsTranslate(BaseMutation):
     class Meta:
         description = "Creates/Updates translations for Shop Settings."
         permissions = (SitePermissions.MANAGE_TRANSLATIONS,)
+        error_type_class = TranslationError
+        error_type_field = "translation_errors"
 
     @classmethod
     def perform_mutation(cls, _root, info, language_code, **data):

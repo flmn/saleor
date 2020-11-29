@@ -1,12 +1,15 @@
 import logging
+import os
 import socket
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Type, Union
 from urllib.parse import urljoin
 
 from babel.numbers import get_territory_currencies
 from django.conf import settings
 from django.contrib.sites.models import Site
+from django.db.models import Model
 from django.utils.encoding import iri_to_uri
+from django.utils.text import slugify
 from django_countries import countries
 from django_countries.fields import Country
 from django_prices_openexchangerates import exchange_currency
@@ -18,7 +21,17 @@ georeader = geolite2.reader()
 logger = logging.getLogger(__name__)
 
 
+if TYPE_CHECKING:
+    # flake8: noqa: F401
+    from django.utils.safestring import SafeText
+
+
 def build_absolute_uri(location: str) -> Optional[str]:
+    """Create absolute uri from location.
+
+    If provided location is absolute uri by itself, it returns unchanged value,
+    otherwise if provided location is relative, absolute uri is built and returned.
+    """
     host = Site.objects.get_current().domain
     protocol = "https" if settings.ENABLE_SSL else "http"
     current_uri = "%s://%s" % (protocol, host)
@@ -61,8 +74,15 @@ def is_valid_ipv6(ip: str) -> bool:
     return True
 
 
+def _get_geo_data_by_ip(ip_address):
+    # This function is here to make it easier to mock the GeoIP
+    # as the georeader object below can be a native platform library
+    # that does not support monkeypatching.
+    return georeader.get(ip_address)
+
+
 def get_country_by_ip(ip_address):
-    geo_data = georeader.get(ip_address)
+    geo_data = _get_geo_data_by_ip(ip_address)
     if geo_data and "country" in geo_data and "iso_code" in geo_data["country"]:
         country_iso_code = geo_data["country"]["iso_code"]
         if country_iso_code in countries:
@@ -74,7 +94,7 @@ def get_currency_for_country(country):
     currencies = get_territory_currencies(country.code)
     if currencies:
         return currencies[0]
-    return settings.DEFAULT_CURRENCY
+    return os.environ.get("DEFAULT_CURRENCY", "USD")
 
 
 def to_local_currency(price, currency):
@@ -111,3 +131,41 @@ def create_thumbnails(pk, model, size_set, image_attr=None):
         logger.info("Created %d thumbnails", num_created)
     if failed_to_create:
         logger.error("Failed to generate thumbnails", extra={"paths": failed_to_create})
+
+
+def generate_unique_slug(
+    instance: Type[Model], slugable_value: str, slug_field_name: str = "slug",
+) -> str:
+    """Create unique slug for model instance.
+
+    The function uses `django.utils.text.slugify` to generate a slug from
+    the `slugable_value` of model field. If the slug already exists it adds
+    a numeric suffix and increments it until a unique value is found.
+
+    Args:
+        instance: model instance for which slug is created
+        slugable_value: value used to create slug
+        slug_field_name: name of slug field in instance model
+
+    """
+    slug = slugify(slugable_value, allow_unicode=True)
+    unique_slug: Union["SafeText", str] = slug
+
+    ModelClass = instance.__class__
+    extension = 1
+
+    search_field = f"{slug_field_name}__iregex"
+    pattern = rf"{slug}-\d+$|{slug}$"
+    slug_values = (
+        ModelClass._default_manager.filter(  # type: ignore
+            **{search_field: pattern}
+        )
+        .exclude(pk=instance.pk)
+        .values_list(slug_field_name, flat=True)
+    )
+
+    while unique_slug in slug_values:
+        extension += 1
+        unique_slug = f"{slug}-{extension}"
+
+    return unique_slug

@@ -1,22 +1,38 @@
 from functools import wraps
+from typing import Iterable, List
 
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
-from django.utils.translation import pgettext
 from prices import Money, TaxedMoney
 
+from ..account.models import User
 from ..core.taxes import zero_money
 from ..core.weight import zero_weight
 from ..discount.models import NotApplicable, Voucher, VoucherType
-from ..discount.utils import get_products_voucher_discount, validate_voucher_in_order
-from ..extensions.manager import get_extensions_manager
+from ..discount.utils import (
+    get_discounted_lines,
+    get_products_voucher_discount,
+    validate_voucher_in_order,
+)
 from ..order import OrderStatus
 from ..order.models import Order, OrderLine
-from ..product.utils import allocate_stock, deallocate_stock, increase_stock
+from ..plugins.manager import get_plugins_manager
 from ..product.utils.digital_products import get_default_digital_content_settings
 from ..shipping.models import ShippingMethod
+from ..warehouse.management import deallocate_stock, increase_stock
+from ..warehouse.models import Warehouse
 from . import events
+
+
+def get_order_country(order: Order) -> str:
+    """Return country to which order will be shipped."""
+    address = order.billing_address
+    if order.is_shipping_required():
+        address = order.shipping_address
+    if address is None:
+        return settings.DEFAULT_COUNTRY
+    return address.country.code
 
 
 def order_line_needs_automatic_fulfillment(line: OrderLine) -> bool:
@@ -33,7 +49,7 @@ def order_line_needs_automatic_fulfillment(line: OrderLine) -> bool:
     return False
 
 
-def order_needs_automatic_fullfilment(order: Order) -> bool:
+def order_needs_automatic_fulfillment(order: Order) -> bool:
     """Check if order has digital products which should be automatically fulfilled."""
     for line in order.lines.digital():
         if order_line_needs_automatic_fulfillment(line):
@@ -100,10 +116,11 @@ def recalculate_order_weight(order):
 
 def update_order_prices(order, discounts):
     """Update prices in order with given discounts and proper taxes."""
-    manager = get_extensions_manager()
+    manager = get_plugins_manager()
+    channel = order.channel
     for line in order:  # type: OrderLine
         if line.variant:
-            unit_price = line.variant.get_price(discounts)
+            unit_price = line.variant.get_price(channel.slug, discounts)
             unit_price = TaxedMoney(unit_price, unit_price)
             line.unit_price = unit_price
             line.save(
@@ -152,30 +169,17 @@ def update_order_status(order):
 
 
 @transaction.atomic
-def add_variant_to_order(
-    order,
-    variant,
-    quantity,
-    discounts=None,
-    allow_overselling=False,
-    track_inventory=True,
-):
+def add_variant_to_draft_order(order, variant, quantity, discounts=None):
     """Add total_quantity of variant to order.
 
     Returns an order line the variant was added to.
-
-    By default, raises InsufficientStock exception if  quantity could not be
-    fulfilled. This can be disabled by setting `allow_overselling` to True.
     """
-    if not allow_overselling:
-        variant.check_quantity(quantity)
-
     try:
         line = order.lines.get(variant=variant)
         line.quantity += quantity
         line.save(update_fields=["quantity"])
     except OrderLine.DoesNotExist:
-        unit_price = variant.get_price(discounts)
+        unit_price = variant.get_price(order.channel.slug, discounts)
         unit_price = TaxedMoney(net=unit_price, gross=unit_price)
         product = variant.product
         product_name = str(product)
@@ -197,10 +201,12 @@ def add_variant_to_order(
             unit_price=unit_price,
             variant=variant,
         )
-        manager = get_extensions_manager()
+        manager = get_plugins_manager()
         unit_price = manager.calculate_order_line_unit(line)
         line.unit_price = unit_price
-        line.tax_rate = unit_price.tax / unit_price.net
+        line.tax_rate = (
+            unit_price.tax / unit_price.net if unit_price.net.amount != 0 else 0
+        )
         line.save(
             update_fields=[
                 "currency",
@@ -210,8 +216,6 @@ def add_variant_to_order(
             ]
         )
 
-    if variant.track_inventory and track_inventory:
-        allocate_stock(variant, quantity)
     return line
 
 
@@ -261,46 +265,82 @@ def delete_order_line(line):
 
 def restock_order_lines(order):
     """Return ordered products to corresponding stocks."""
+    country = get_order_country(order)
+    default_warehouse = Warehouse.objects.filter(
+        shipping_zones__countries__contains=country
+    ).first()
+
     for line in order:
         if line.variant and line.variant.track_inventory:
             if line.quantity_unfulfilled > 0:
-                deallocate_stock(line.variant, line.quantity_unfulfilled)
+                deallocate_stock(line, line.quantity_unfulfilled)
             if line.quantity_fulfilled > 0:
-                increase_stock(line.variant, line.quantity_fulfilled)
+                allocation = line.allocations.first()
+                warehouse = (
+                    allocation.stock.warehouse if allocation else default_warehouse
+                )
+                increase_stock(line, warehouse, line.quantity_fulfilled)
 
         if line.quantity_fulfilled > 0:
             line.quantity_fulfilled = 0
             line.save(update_fields=["quantity_fulfilled"])
 
 
-def restock_fulfillment_lines(fulfillment):
-    """Return fulfilled products to corresponding stocks."""
+def restock_fulfillment_lines(fulfillment, warehouse):
+    """Return fulfilled products to corresponding stocks.
+
+    Return products to stocks and update order lines quantity fulfilled values.
+    """
+    order_lines = []
     for line in fulfillment:
         if line.order_line.variant and line.order_line.variant.track_inventory:
-            increase_stock(line.order_line.variant, line.quantity, allocate=True)
+            increase_stock(line.order_line, warehouse, line.quantity, allocate=True)
+        order_line = line.order_line
+        order_line.quantity_fulfilled -= line.quantity
+        order_lines.append(order_line)
+    OrderLine.objects.bulk_update(order_lines, ["quantity_fulfilled"])
 
 
-def sum_order_totals(qs):
-    zero = Money(0, currency=settings.DEFAULT_CURRENCY)
+def sum_order_totals(qs, currency_code):
+    zero = Money(0, currency=currency_code)
     taxed_zero = TaxedMoney(zero, zero)
     return sum([order.total for order in qs], taxed_zero)
 
 
 def get_valid_shipping_methods_for_order(order: Order):
     return ShippingMethod.objects.applicable_shipping_methods_for_instance(
-        order, price=order.get_subtotal().gross
+        order, channel_id=order.channel_id, price=order.get_subtotal().gross
     )
 
 
-def get_products_voucher_discount_for_order(voucher: Voucher) -> Money:
+def get_prices_of_discounted_specific_product(
+    lines: Iterable[OrderLine], voucher: Voucher,
+) -> List[Money]:
+    """Get prices of variants belonging to the discounted specific products.
+
+    Specific products are products, collections and categories.
+    Product must be assigned directly to the discounted category, assigning
+    product to child category won't work.
+    """
+    line_prices = []
+    discounted_lines = get_discounted_lines(lines, voucher)
+
+    for line in discounted_lines:
+        line_prices.extend([line.unit_price_gross] * line.quantity)
+
+    return line_prices
+
+
+def get_products_voucher_discount_for_order(order: Order) -> Money:
     """Calculate products discount value for a voucher, depending on its type."""
     prices = None
+    voucher = order.voucher
+    if voucher and voucher.type == VoucherType.SPECIFIC_PRODUCT:
+        prices = get_prices_of_discounted_specific_product(order.lines.all(), voucher)
     if not prices:
-        msg = pgettext(
-            "Voucher not applicable", "This offer is only valid for selected items."
-        )
+        msg = "This offer is only valid for selected items."
         raise NotApplicable(msg)
-    return get_products_voucher_discount(voucher, prices)
+    return get_products_voucher_discount(voucher, prices, order.channel)  # type: ignore
 
 
 def get_voucher_discount_for_order(order: Order) -> Money:
@@ -313,9 +353,15 @@ def get_voucher_discount_for_order(order: Order) -> Money:
     validate_voucher_in_order(order)
     subtotal = order.get_subtotal()
     if order.voucher.type == VoucherType.ENTIRE_ORDER:
-        return order.voucher.get_discount_amount_for(subtotal.gross)
+        return order.voucher.get_discount_amount_for(subtotal.gross, order.channel)
     if order.voucher.type == VoucherType.SHIPPING:
-        return order.voucher.get_discount_amount_for(order.shipping_price)
+        return order.voucher.get_discount_amount_for(
+            order.shipping_price, order.channel
+        )
     if order.voucher.type == VoucherType.SPECIFIC_PRODUCT:
-        return get_products_voucher_discount_for_order(order.voucher)
+        return get_products_voucher_discount_for_order(order)
     raise NotImplementedError("Unknown discount type")
+
+
+def match_orders_with_new_user(user: User) -> None:
+    Order.objects.confirmed().filter(user_email=user.email, user=None).update(user=user)

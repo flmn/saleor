@@ -1,7 +1,5 @@
 import graphene
-from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.core.management import call_command
 
 from ...account import models as account_models
 from ...core.error_codes import ShopErrorCode
@@ -13,7 +11,6 @@ from ..account.types import AddressInput
 from ..core.enums import WeightUnitsEnum
 from ..core.mutations import BaseMutation, ModelDeleteMutation, ModelMutation
 from ..core.types.common import ShopError
-from ..product.types import Collection
 from .types import AuthorizationKey, AuthorizationKeyType, Shop
 
 
@@ -170,39 +167,14 @@ class ShopFetchTaxRates(BaseMutation):
         error_type_field = "shop_errors"
 
     @classmethod
-    def perform_mutation(cls, _root, _info):
-        if not settings.VATLAYER_ACCESS_KEY:
+    def perform_mutation(cls, _root, info):
+        if not info.context.plugins.fetch_taxes_data():
             raise ValidationError(
                 "Could not fetch tax rates. Make sure you have supplied a "
-                "valid API Access Key.",
-                code=ShopErrorCode.CANNOT_FETCH_TAX_RATES,
+                "valid credential for your tax plugin.",
+                code=ShopErrorCode.CANNOT_FETCH_TAX_RATES.value,
             )
-        call_command("get_vat_rates")
         return ShopFetchTaxRates(shop=Shop())
-
-
-class HomepageCollectionUpdate(BaseMutation):
-    shop = graphene.Field(Shop, description="Updated shop.")
-
-    class Arguments:
-        collection = graphene.ID(description="Collection displayed on homepage.")
-
-    class Meta:
-        description = "Updates homepage collection of the shop."
-        permissions = (SitePermissions.MANAGE_SETTINGS,)
-        error_type_class = ShopError
-        error_type_field = "shop_errors"
-
-    @classmethod
-    def perform_mutation(cls, _root, info, collection=None):
-        new_collection = cls.get_node_or_error(
-            info, collection, field="collection", only_type=Collection
-        )
-        site_settings = info.context.site.settings
-        site_settings.homepage_collection = new_collection
-        cls.clean_instance(info, site_settings)
-        site_settings.save(update_fields=["homepage_collection"])
-        return HomepageCollectionUpdate(shop=Shop())
 
 
 class AuthorizationKeyInput(graphene.InputObjectType):

@@ -1,12 +1,14 @@
 from enum import Enum
 
-from django.utils.translation import pgettext_lazy
-
 
 class PaymentError(Exception):
-    def __init__(self, message):
-        super(PaymentError, self).__init__(message)
+    def __init__(self, message, code=None):
+        super(PaymentError, self).__init__(message, code)
         self.message = message
+        self.code = code
+
+    def __str__(self):
+        return self.message
 
 
 class GatewayError(IOError):
@@ -16,7 +18,7 @@ class GatewayError(IOError):
 class CustomPaymentChoices:
     MANUAL = "manual"
 
-    CHOICES = [(MANUAL, pgettext_lazy("Custom payment choice type", "Manual"))]
+    CHOICES = [(MANUAL, "Manual")]
 
 
 class OperationType(Enum):
@@ -55,20 +57,33 @@ class TransactionKind:
     - REFUND - full or partial return of captured funds to the customer.
     """
 
+    EXTERNAL = "external"
     AUTH = "auth"
     CAPTURE = "capture"
+    CAPTURE_FAILED = "capture_failed"
+    ACTION_TO_CONFIRM = "action_to_confirm"
     VOID = "void"
+    PENDING = "pending"
     REFUND = "refund"
+    REFUND_ONGOING = "refund_ongoing"
+    REFUND_FAILED = "refund_failed"
+    REFUND_REVERSED = "refund_reversed"
     CONFIRM = "confirm"
+    CANCEL = "cancel"
     # FIXME we could use another status like WAITING_FOR_AUTH for transactions
     # Which were authorized, but needs to be confirmed manually by staff
     # eg. Braintree with "submit_for_settlement" enabled
     CHOICES = [
-        (AUTH, pgettext_lazy("transaction kind", "Authorization")),
-        (REFUND, pgettext_lazy("transaction kind", "Refund")),
-        (CAPTURE, pgettext_lazy("transaction kind", "Capture")),
-        (VOID, pgettext_lazy("transaction kind", "Void")),
-        (CONFIRM, pgettext_lazy("transaction kind", "Confirm")),
+        (EXTERNAL, "External reference"),
+        (AUTH, "Authorization"),
+        (PENDING, "Pending"),
+        (ACTION_TO_CONFIRM, "Action to confirm"),
+        (REFUND, "Refund"),
+        (REFUND_ONGOING, "Refund in progress"),
+        (CAPTURE, "Capture"),
+        (VOID, "Void"),
+        (CONFIRM, "Confirm"),
+        (CANCEL, "Cancel"),
     ]
 
 
@@ -86,15 +101,21 @@ class ChargeStatus:
     """
 
     NOT_CHARGED = "not-charged"
+    PENDING = "pending"
     PARTIALLY_CHARGED = "partially-charged"
     FULLY_CHARGED = "fully-charged"
     PARTIALLY_REFUNDED = "partially-refunded"
     FULLY_REFUNDED = "fully-refunded"
+    REFUSED = "refused"
+    CANCELLED = "cancelled"
 
     CHOICES = [
-        (NOT_CHARGED, pgettext_lazy("payment status", "Not charged")),
-        (PARTIALLY_CHARGED, pgettext_lazy("payment status", "Partially charged")),
-        (FULLY_CHARGED, pgettext_lazy("payment status", "Fully charged")),
-        (PARTIALLY_REFUNDED, pgettext_lazy("payment status", "Partially refunded")),
-        (FULLY_REFUNDED, pgettext_lazy("payment status", "Fully refunded")),
+        (NOT_CHARGED, "Not charged"),
+        (PENDING, "Pending"),
+        (PARTIALLY_CHARGED, "Partially charged"),
+        (FULLY_CHARGED, "Fully charged"),
+        (PARTIALLY_REFUNDED, "Partially refunded"),
+        (FULLY_REFUNDED, "Fully refunded"),
+        (REFUSED, "Refused"),
+        (CANCELLED, "Cancelled"),
     ]

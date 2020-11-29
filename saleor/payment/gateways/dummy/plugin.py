@@ -1,10 +1,8 @@
 from typing import TYPE_CHECKING
 
-from django.utils.translation import pgettext_lazy
+from saleor.plugins.base_plugin import BasePlugin, ConfigurationTypeField
 
-from saleor.extensions import ConfigurationTypeField
-from saleor.extensions.base_plugin import BasePlugin
-
+from ..utils import get_supported_currencies
 from . import (
     GatewayConfig,
     authorize,
@@ -25,7 +23,6 @@ if TYPE_CHECKING:
 def require_active_plugin(fn):
     def wrapped(self, *args, **kwargs):
         previous = kwargs.get("previous_value", None)
-        self._initialize_plugin_configuration()
         if not self.active:
             return previous
         return fn(self, *args, **kwargs)
@@ -34,61 +31,43 @@ def require_active_plugin(fn):
 
 
 class DummyGatewayPlugin(BasePlugin):
+    PLUGIN_ID = "mirumee.payments.dummy"
     PLUGIN_NAME = GATEWAY_NAME
+    DEFAULT_ACTIVE = True
+    DEFAULT_CONFIGURATION = [
+        {"name": "Store customers card", "value": False},
+        {"name": "Automatic payment capture", "value": True},
+        {"name": "Supported currencies", "value": "USD, PLN"},
+    ]
     CONFIG_STRUCTURE = {
         "Store customers card": {
             "type": ConfigurationTypeField.BOOLEAN,
-            "help_text": pgettext_lazy(
-                "Plugin help text", "Determines if Saleor should store cards."
-            ),
-            "label": pgettext_lazy("Plugin label", "Store customers card"),
+            "help_text": "Determines if Saleor should store cards.",
+            "label": "Store customers card",
         },
         "Automatic payment capture": {
             "type": ConfigurationTypeField.BOOLEAN,
-            "help_text": pgettext_lazy(
-                "Plugin help text",
-                "Determines if Saleor should automaticaly capture payments.",
-            ),
-            "label": pgettext_lazy("Plugin label", "Automatic payment capture"),
+            "help_text": "Determines if Saleor should automaticaly capture payments.",
+            "label": "Automatic payment capture",
+        },
+        "Supported currencies": {
+            "type": ConfigurationTypeField.STRING,
+            "help_text": "Determines currencies supported by gateway."
+            " Please enter currency codes separated by a comma.",
+            "label": "Supported currencies",
         },
     }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.active = True
+        configuration = {item["name"]: item["value"] for item in self.configuration}
         self.config = GatewayConfig(
             gateway_name=GATEWAY_NAME,
-            auto_capture=True,
+            auto_capture=configuration["Automatic payment capture"],
+            supported_currencies=configuration["Supported currencies"],
             connection_params={},
-            store_customer=False,
+            store_customer=configuration["Store customers card"],
         )
-
-    def _initialize_plugin_configuration(self):
-        super()._initialize_plugin_configuration()
-
-        if self._cached_config and self._cached_config.configuration:
-            configuration = self._cached_config.configuration
-
-            configuration = {item["name"]: item["value"] for item in configuration}
-            self.config = GatewayConfig(
-                gateway_name=GATEWAY_NAME,
-                auto_capture=configuration["Automatic payment capture"],
-                connection_params={},
-                store_customer=configuration["Store customers card"],
-            )
-
-    @classmethod
-    def _get_default_configuration(cls):
-        defaults = {
-            "name": cls.PLUGIN_NAME,
-            "description": "",
-            "active": True,
-            "configuration": [
-                {"name": "Store customers card", "value": False},
-                {"name": "Automatic payment capture", "value": True},
-            ],
-        }
-        return defaults
 
     def _get_gateway_config(self):
         return self.config
@@ -132,6 +111,11 @@ class DummyGatewayPlugin(BasePlugin):
     @require_active_plugin
     def get_client_token(self, token_config: "TokenConfig", previous_value):
         return get_client_token()
+
+    @require_active_plugin
+    def get_supported_currencies(self, previous_value):
+        config = self._get_gateway_config()
+        return get_supported_currencies(config, GATEWAY_NAME)
 
     @require_active_plugin
     def get_payment_config(self, previous_value):

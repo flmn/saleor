@@ -2,15 +2,14 @@ from typing import Dict, List, Optional
 
 import braintree as braintree_sdk
 from django.core.exceptions import ImproperlyConfigured
-from django.utils.translation import pgettext_lazy
 
 from ... import TransactionKind
 from ...interface import (
-    CreditCardInfo,
     CustomerSource,
     GatewayConfig,
     GatewayResponse,
     PaymentData,
+    PaymentMethodInfo,
     TokenConfig,
 )
 from .errors import DEFAULT_ERROR_MESSAGE, BraintreeException
@@ -58,9 +57,7 @@ def get_error_for_client(errors: List) -> str:
     """Filter all error messages and decides which one is visible for the client."""
     if not errors:
         return ""
-    default_msg = pgettext_lazy(
-        "payment error", "Unable to process transaction. Please try again in a moment"
-    )
+    default_msg = "Unable to process transaction. Please try again in a moment"
     for error in errors:
         if error["code"] in ERROR_CODES_WHITELIST:
             return ERROR_CODES_WHITELIST[error["code"]] or error["message"]
@@ -138,6 +135,7 @@ def authorize(
     gateway_response = extract_gateway_response(result)
     error = get_error_for_client(gateway_response["errors"])
     kind = TransactionKind.CAPTURE if config.auto_capture else TransactionKind.AUTH
+    credit_card = gateway_response.get("credit_card", {})
     return GatewayResponse(
         is_success=result.is_success,
         action_required=False,
@@ -149,6 +147,14 @@ def authorize(
             "transaction_id", payment_information.token
         ),
         error=error,
+        payment_method_info=PaymentMethodInfo(
+            last_4=credit_card.get("last_4"),
+            exp_year=credit_card.get("expiration_year"),
+            exp_month=credit_card.get("expiration_month"),
+            brand=credit_card.get("card_type", "").lower(),
+            name=credit_card.get("cardholder_name"),
+            type="card",
+        ),
         raw_response=gateway_response,
     )
 
@@ -286,11 +292,11 @@ def list_client_sources(
 
 
 def extract_credit_card_data(card, gateway_name):
-    credit_card = CreditCardInfo(
+    credit_card = PaymentMethodInfo(
         exp_year=int(card.expiration_year),
         exp_month=int(card.expiration_month),
         last_4=card.last_4,
-        name_on_card=card.cardholder_name,
+        name=card.cardholder_name,
     )
     return CustomerSource(
         id=card.unique_number_identifier,

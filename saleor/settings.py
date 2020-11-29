@@ -1,13 +1,19 @@
 import ast
 import os.path
 import warnings
+from datetime import timedelta
 
 import dj_database_url
 import dj_email_url
+import django_cache_url
+import jaeger_client
+import jaeger_client.config
+import pkg_resources
 import sentry_sdk
-from django.contrib.messages import constants as messages
-from django.utils.translation import gettext_lazy as _, pgettext_lazy
-from django_prices.utils.formatting import get_currency_fraction
+from django.core.exceptions import ImproperlyConfigured
+from django.core.management.utils import get_random_secret_key
+from pytimeparse import parse
+from sentry_sdk.integrations.celery import CeleryIntegration
 from sentry_sdk.integrations.django import DjangoIntegration
 
 
@@ -40,9 +46,18 @@ ADMINS = (
 )
 MANAGERS = ADMINS
 
-ALLOWED_CLIENT_HOSTS = get_list(
-    os.environ.get("ALLOWED_CLIENT_HOSTS", "localhost,127.0.0.1")
-)
+_DEFAULT_CLIENT_HOSTS = "localhost,127.0.0.1"
+
+ALLOWED_CLIENT_HOSTS = os.environ.get("ALLOWED_CLIENT_HOSTS")
+if not ALLOWED_CLIENT_HOSTS:
+    if DEBUG:
+        ALLOWED_CLIENT_HOSTS = _DEFAULT_CLIENT_HOSTS
+    else:
+        raise ImproperlyConfigured(
+            "ALLOWED_CLIENT_HOSTS environment variable must be set when DEBUG=False."
+        )
+
+ALLOWED_CLIENT_HOSTS = get_list(ALLOWED_CLIENT_HOSTS)
 
 INTERNAL_IPS = get_list(os.environ.get("INTERNAL_IPS", "127.0.0.1"))
 
@@ -53,52 +68,58 @@ DATABASES = {
 }
 
 
-TIME_ZONE = "America/Chicago"
+TIME_ZONE = "UTC"
 LANGUAGE_CODE = "en"
 LANGUAGES = [
-    ("ar", _("Arabic")),
-    ("az", _("Azerbaijani")),
-    ("bg", _("Bulgarian")),
-    ("bn", _("Bengali")),
-    ("ca", _("Catalan")),
-    ("cs", _("Czech")),
-    ("da", _("Danish")),
-    ("de", _("German")),
-    ("el", _("Greek")),
-    ("en", _("English")),
-    ("es", _("Spanish")),
-    ("es-co", _("Colombian Spanish")),
-    ("et", _("Estonian")),
-    ("fa", _("Persian")),
-    ("fr", _("French")),
-    ("hi", _("Hindi")),
-    ("hu", _("Hungarian")),
-    ("hy", _("Armenian")),
-    ("id", _("Indonesian")),
-    ("is", _("Icelandic")),
-    ("it", _("Italian")),
-    ("ja", _("Japanese")),
-    ("ko", _("Korean")),
-    ("lt", _("Lithuanian")),
-    ("mn", _("Mongolian")),
-    ("nb", _("Norwegian")),
-    ("nl", _("Dutch")),
-    ("pl", _("Polish")),
-    ("pt", _("Portuguese")),
-    ("pt-br", _("Brazilian Portuguese")),
-    ("ro", _("Romanian")),
-    ("ru", _("Russian")),
-    ("sk", _("Slovak")),
-    ("sq", _("Albanian")),
-    ("sr", _("Serbian")),
-    ("sw", _("Swahili")),
-    ("sv", _("Swedish")),
-    ("th", _("Thai")),
-    ("tr", _("Turkish")),
-    ("uk", _("Ukrainian")),
-    ("vi", _("Vietnamese")),
-    ("zh-hans", _("Simplified Chinese")),
-    ("zh-hant", _("Traditional Chinese")),
+    ("ar", "Arabic"),
+    ("az", "Azerbaijani"),
+    ("bg", "Bulgarian"),
+    ("bn", "Bengali"),
+    ("ca", "Catalan"),
+    ("cs", "Czech"),
+    ("da", "Danish"),
+    ("de", "German"),
+    ("el", "Greek"),
+    ("en", "English"),
+    ("es", "Spanish"),
+    ("es-co", "Colombian Spanish"),
+    ("et", "Estonian"),
+    ("fa", "Persian"),
+    ("fi", "Finnish"),
+    ("fr", "French"),
+    ("hi", "Hindi"),
+    ("hu", "Hungarian"),
+    ("hy", "Armenian"),
+    ("id", "Indonesian"),
+    ("is", "Icelandic"),
+    ("it", "Italian"),
+    ("ja", "Japanese"),
+    ("ka", "Georgian"),
+    ("km", "Khmer"),
+    ("ko", "Korean"),
+    ("lt", "Lithuanian"),
+    ("mn", "Mongolian"),
+    ("my", "Burmese"),
+    ("nb", "Norwegian"),
+    ("nl", "Dutch"),
+    ("pl", "Polish"),
+    ("pt", "Portuguese"),
+    ("pt-br", "Brazilian Portuguese"),
+    ("ro", "Romanian"),
+    ("ru", "Russian"),
+    ("sk", "Slovak"),
+    ("sl", "Slovenian"),
+    ("sq", "Albanian"),
+    ("sr", "Serbian"),
+    ("sv", "Swedish"),
+    ("sw", "Swahili"),
+    ("ta", "Tamil"),
+    ("th", "Thai"),
+    ("tr", "Turkish"),
+    ("uk", "Ukrainian"),
+    ("vi", "Vietnamese"),
+    ("zh-hans", "Simplified Chinese"),
+    ("zh-hant", "Traditional Chinese"),
 ]
 LOCALE_PATHS = [os.path.join(PROJECT_ROOT, "locale")]
 USE_I18N = True
@@ -128,6 +149,11 @@ EMAIL_BACKEND = email_config["EMAIL_BACKEND"]
 EMAIL_USE_TLS = email_config["EMAIL_USE_TLS"]
 EMAIL_USE_SSL = email_config["EMAIL_USE_SSL"]
 
+# If enabled, make sure you have set proper storefront address in ALLOWED_CLIENT_HOSTS.
+ENABLE_ACCOUNT_CONFIRMATION_BY_EMAIL = get_bool_from_env(
+    "ENABLE_ACCOUNT_CONFIRMATION_BY_EMAIL", True
+)
+
 ENABLE_SSL = get_bool_from_env("ENABLE_SSL", False)
 
 if ENABLE_SSL:
@@ -152,7 +178,6 @@ context_processors = [
     "django.template.context_processors.debug",
     "django.template.context_processors.media",
     "django.template.context_processors.static",
-    "saleor.checkout.context_processors.checkout_counter",
     "saleor.site.context_processors.site",
 ]
 
@@ -177,17 +202,21 @@ TEMPLATES = [
 # Make this unique, and don't share it with anybody.
 SECRET_KEY = os.environ.get("SECRET_KEY")
 
+if not SECRET_KEY and DEBUG:
+    warnings.warn("SECRET_KEY not configured, using a random temporary key.")
+    SECRET_KEY = get_random_secret_key()
+
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.middleware.common.CommonMiddleware",
+    "saleor.core.middleware.request_time",
     "saleor.core.middleware.discounts",
     "saleor.core.middleware.google_analytics",
     "saleor.core.middleware.country",
     "saleor.core.middleware.currency",
     "saleor.core.middleware.site",
-    "saleor.core.middleware.extensions",
-    "saleor.graphql.middleware.jwt_middleware",
-    "saleor.graphql.middleware.service_account_middleware",
+    "saleor.core.middleware.plugins",
+    "saleor.core.middleware.jwt_refresh_token_middleware",
 ]
 
 INSTALLED_APPS = [
@@ -200,25 +229,30 @@ INSTALLED_APPS = [
     "django.contrib.auth",
     "django.contrib.postgres",
     # Local apps
-    "saleor.extensions",
+    "saleor.plugins",
     "saleor.account",
     "saleor.discount",
     "saleor.giftcard",
     "saleor.product",
+    "saleor.attribute",
+    "saleor.channel",
     "saleor.checkout",
     "saleor.core",
+    "saleor.csv",
     "saleor.graphql",
     "saleor.menu",
     "saleor.order",
+    "saleor.invoice",
     "saleor.seo",
     "saleor.shipping",
     "saleor.search",
     "saleor.site",
-    "saleor.data_feeds",
     "saleor.page",
     "saleor.payment",
+    "saleor.warehouse",
     "saleor.webhook",
     "saleor.wishlist",
+    "saleor.app",
     # External apps
     "versatileimagefield",
     "django_measurement",
@@ -245,7 +279,7 @@ if ENABLE_DEBUG_TOOLBAR:
         )
         warnings.warn(msg)
     else:
-        INSTALLED_APPS += ["debug_toolbar", "graphiql_debug_toolbar"]
+        INSTALLED_APPS += ["django.forms", "debug_toolbar", "graphiql_debug_toolbar"]
         MIDDLEWARE.append("saleor.graphql.middleware.DebugToolbarMiddleware")
 
         DEBUG_TOOLBAR_PANELS = [
@@ -258,61 +292,56 @@ if ENABLE_DEBUG_TOOLBAR:
         ]
         DEBUG_TOOLBAR_CONFIG = {"RESULTS_CACHE_SIZE": 100}
 
-ENABLE_SILK = get_bool_from_env("ENABLE_SILK", False)
-if ENABLE_SILK:
-    MIDDLEWARE.insert(0, "silk.middleware.SilkyMiddleware")
-    INSTALLED_APPS.append("silk")
-
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
-    "root": {"level": "INFO", "handlers": ["console"]},
+    "root": {"level": "INFO", "handlers": ["default"]},
     "formatters": {
+        "django.server": {
+            "()": "django.utils.log.ServerFormatter",
+            "format": "[{server_time}] {message}",
+            "style": "{",
+        },
+        "json": {
+            "()": "saleor.core.logging.JsonFormatter",
+            "datefmt": "%Y-%m-%dT%H:%M:%SZ",
+            "format": (
+                "%(asctime)s %(levelname)s %(lineno)s %(message)s %(name)s "
+                + "%(pathname)s %(process)d %(threadName)s"
+            ),
+        },
         "verbose": {
             "format": (
                 "%(levelname)s %(name)s %(message)s [PID:%(process)d:%(threadName)s]"
             )
         },
-        "simple": {"format": "%(levelname)s %(message)s"},
     },
-    "filters": {"require_debug_false": {"()": "django.utils.log.RequireDebugFalse"}},
     "handlers": {
-        "mail_admins": {
-            "level": "ERROR",
-            "filters": ["require_debug_false"],
-            "class": "django.utils.log.AdminEmailHandler",
-        },
-        "console": {
+        "default": {
             "level": "DEBUG",
             "class": "logging.StreamHandler",
-            "formatter": "verbose",
+            "formatter": "verbose" if DEBUG else "json",
         },
-        "null": {"class": "logging.NullHandler"},
+        "django.server": {
+            "level": "INFO",
+            "class": "logging.StreamHandler",
+            "formatter": "django.server" if DEBUG else "json",
+        },
     },
     "loggers": {
-        "django": {
-            "handlers": ["console", "mail_admins"],
+        "django": {"level": "INFO", "propagate": True},
+        "django.server": {
+            "handlers": ["django.server"],
             "level": "INFO",
-            "propagate": True,
+            "propagate": False,
         },
-        "django.server": {"handlers": ["console"], "level": "INFO", "propagate": True},
-        "saleor": {"handlers": ["console"], "level": "DEBUG", "propagate": True},
+        "saleor": {"level": "DEBUG", "propagate": True},
         "saleor.graphql.errors.handled": {
-            "handlers": ["console"],
+            "handlers": ["default"],
             "level": "ERROR",
-            "propagate": True,
+            "propagate": False,
         },
-        # You can configure this logger to go to another file using a file handler.
-        # Refer to https://docs.djangoproject.com/en/2.2/topics/logging/#examples.
-        # This allow easier filtering from GraphQL query/permission errors that may
-        # have been triggered by your frontend applications from the internal errors
-        # that happen in backend
-        "saleor.graphql.errors.unhandled": {
-            "handlers": ["console"],
-            "level": "ERROR",
-            "propagate": True,
-        },
-        "graphql.execution.utils": {"handlers": ["null"], "propagate": False},
+        "graphql.execution.utils": {"propagate": False},
     },
 }
 
@@ -327,7 +356,7 @@ AUTH_PASSWORD_VALIDATORS = [
 
 DEFAULT_COUNTRY = os.environ.get("DEFAULT_COUNTRY", "US")
 DEFAULT_CURRENCY = os.environ.get("DEFAULT_CURRENCY", "USD")
-DEFAULT_DECIMAL_PLACES = get_currency_fraction(DEFAULT_CURRENCY)
+DEFAULT_DECIMAL_PLACES = 3
 DEFAULT_MAX_DIGITS = 12
 DEFAULT_CURRENCY_CODE_LENGTH = 3
 
@@ -336,33 +365,9 @@ DEFAULT_CURRENCY_CODE_LENGTH = 3
 # Following the recommendation of https://tools.ietf.org/html/rfc5322#section-2.1.1
 DEFAULT_MAX_EMAIL_DISPLAY_NAME_LENGTH = 78
 
-# note: having multiple currencies is not supported yet
-AVAILABLE_CURRENCIES = [DEFAULT_CURRENCY]
-
-COUNTRIES_OVERRIDE = {
-    "EU": pgettext_lazy(
-        "Name of political and economical union of european countries", "European Union"
-    )
-}
+COUNTRIES_OVERRIDE = {"EU": "European Union"}
 
 OPENEXCHANGERATES_API_KEY = os.environ.get("OPENEXCHANGERATES_API_KEY")
-
-# VAT configuration
-# Enabling vat requires valid vatlayer access key.
-# If you are subscribed to a paid vatlayer plan, you can enable HTTPS.
-VATLAYER_ACCESS_KEY = os.environ.get("VATLAYER_ACCESS_KEY")
-VATLAYER_USE_HTTPS = get_bool_from_env("VATLAYER_USE_HTTPS", False)
-
-# Avatax supports two ways of log in - username:password or account:license
-AVATAX_USERNAME_OR_ACCOUNT = os.environ.get("AVATAX_USERNAME_OR_ACCOUNT")
-AVATAX_PASSWORD_OR_LICENSE = os.environ.get("AVATAX_PASSWORD_OR_LICENSE")
-AVATAX_USE_SANDBOX = get_bool_from_env("AVATAX_USE_SANDBOX", DEBUG)
-AVATAX_COMPANY_NAME = os.environ.get("AVATAX_COMPANY_NAME", "DEFAULT")
-AVATAX_AUTOCOMMIT = get_bool_from_env("AVATAX_AUTOCOMMIT", False)
-
-ACCOUNT_ACTIVATION_DAYS = 3
-
-LOGIN_REDIRECT_URL = "home"
 
 GOOGLE_ANALYTICS_TRACKING_ID = os.environ.get("GOOGLE_ANALYTICS_TRACKING_ID")
 
@@ -377,17 +382,15 @@ PAYMENT_HOST = get_host
 
 PAYMENT_MODEL = "order.Payment"
 
-SESSION_SERIALIZER = "django.contrib.sessions.serializers.JSONSerializer"
-
-MESSAGE_TAGS = {messages.ERROR: "danger"}
-
-LOW_STOCK_THRESHOLD = 10
 MAX_CHECKOUT_LINE_QUANTITY = int(os.environ.get("MAX_CHECKOUT_LINE_QUANTITY", 50))
 
-TEST_RUNNER = "tests.runner.PytestTestRunner"
+TEST_RUNNER = "saleor.tests.runner.PytestTestRunner"
+
+
+PLAYGROUND_ENABLED = get_bool_from_env("PLAYGROUND_ENABLED", True)
 
 ALLOWED_HOSTS = get_list(os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1"))
-ALLOWED_GRAPHQL_ORIGINS = os.environ.get("ALLOWED_GRAPHQL_ORIGINS", "*")
+ALLOWED_GRAPHQL_ORIGINS = get_list(os.environ.get("ALLOWED_GRAPHQL_ORIGINS", "*"))
 
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
@@ -398,6 +401,7 @@ AWS_LOCATION = os.environ.get("AWS_LOCATION", "")
 AWS_MEDIA_BUCKET_NAME = os.environ.get("AWS_MEDIA_BUCKET_NAME")
 AWS_MEDIA_CUSTOM_DOMAIN = os.environ.get("AWS_MEDIA_CUSTOM_DOMAIN")
 AWS_QUERYSTRING_AUTH = get_bool_from_env("AWS_QUERYSTRING_AUTH", False)
+AWS_QUERYSTRING_EXPIRE = get_bool_from_env("AWS_QUERYSTRING_EXPIRE", 3600)
 AWS_S3_CUSTOM_DOMAIN = os.environ.get("AWS_STATIC_CUSTOM_DOMAIN")
 AWS_S3_ENDPOINT_URL = os.environ.get("AWS_S3_ENDPOINT_URL", None)
 AWS_S3_REGION_NAME = os.environ.get("AWS_S3_REGION_NAME", None)
@@ -456,19 +460,14 @@ PLACEHOLDER_IMAGES = {
 
 DEFAULT_PLACEHOLDER = "images/placeholder255x255.png"
 
-LOGOUT_ON_PASSWORD_CHANGE = False
-
 SEARCH_BACKEND = "saleor.search.backends.postgresql"
 
 AUTHENTICATION_BACKENDS = [
-    "graphql_jwt.backends.JSONWebTokenBackend",
-    "django.contrib.auth.backends.ModelBackend",
+    "saleor.core.auth_backend.JSONWebTokenBackend",
 ]
 
-
-GRAPHQL_JWT = {"JWT_PAYLOAD_HANDLER": "saleor.graphql.utils.create_jwt_payload"}
-
 # CELERY SETTINGS
+CELERY_TIMEZONE = TIME_ZONE
 CELERY_BROKER_URL = (
     os.environ.get("CELERY_BROKER_URL", os.environ.get("CLOUDAMQP_URL")) or ""
 )
@@ -478,66 +477,110 @@ CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", None)
 
-# Rich-text editor
-ALLOWED_TAGS = [
-    "a",
-    "b",
-    "blockquote",
-    "br",
-    "em",
-    "h2",
-    "h3",
-    "i",
-    "img",
-    "li",
-    "ol",
-    "p",
-    "strong",
-    "ul",
-]
-ALLOWED_ATTRIBUTES = {"*": ["align", "style"], "a": ["href", "title"], "img": ["src"]}
-ALLOWED_STYLES = ["text-align"]
+# Change this value if your application is running behind a proxy,
+# e.g. HTTP_CF_Connecting_IP for Cloudflare or X_FORWARDED_FOR
+REAL_IP_ENVIRON = os.environ.get("REAL_IP_ENVIRON", "REMOTE_ADDR")
 
+# The maximum length of a graphql query to log in tracings
+OPENTRACING_MAX_QUERY_LENGTH_LOG = 2000
 
 # Slugs for menus precreated in Django migrations
 DEFAULT_MENUS = {"top_menu_name": "navbar", "bottom_menu_name": "footer"}
 
-# This enable the new 'No Captcha reCaptcha' version (the simple checkbox)
-# instead of the old (deprecated) one. For more information see:
-#   https://github.com/praekelt/django-recaptcha/blob/34af16ba1e/README.rst
-NOCAPTCHA = True
-
-# Set Google's reCaptcha keys
-RECAPTCHA_PUBLIC_KEY = os.environ.get("RECAPTCHA_PUBLIC_KEY")
-RECAPTCHA_PRIVATE_KEY = os.environ.get("RECAPTCHA_PRIVATE_KEY")
+# Slug for channel precreated in Django migrations
+DEFAULT_CHANNEL_SLUG = os.environ.get("DEFAULT_CHANNEL_SLUG", "default-channel")
 
 
 #  Sentry
 SENTRY_DSN = os.environ.get("SENTRY_DSN")
 if SENTRY_DSN:
-    sentry_sdk.init(dsn=SENTRY_DSN, integrations=[DjangoIntegration()])
+    sentry_sdk.init(
+        dsn=SENTRY_DSN, integrations=[CeleryIntegration(), DjangoIntegration()]
+    )
 
 GRAPHENE = {
     "RELAY_CONNECTION_ENFORCE_FIRST_OR_LAST": True,
     "RELAY_CONNECTION_MAX_LIMIT": 100,
+    "MIDDLEWARE": [
+        "saleor.graphql.middleware.OpentracingGrapheneMiddleware",
+        "saleor.graphql.middleware.JWTMiddleware",
+        "saleor.graphql.middleware.app_middleware",
+    ],
 }
 
-EXTENSIONS_MANAGER = "saleor.extensions.manager.ExtensionsManager"
+PLUGINS_MANAGER = "saleor.plugins.manager.PluginsManager"
 
 PLUGINS = [
-    "saleor.extensions.plugins.avatax.plugin.AvataxPlugin",
-    "saleor.extensions.plugins.vatlayer.plugin.VatlayerPlugin",
-    "saleor.extensions.plugins.webhook.plugin.WebhookPlugin",
+    "saleor.plugins.avatax.plugin.AvataxPlugin",
+    "saleor.plugins.vatlayer.plugin.VatlayerPlugin",
+    "saleor.plugins.webhook.plugin.WebhookPlugin",
     "saleor.payment.gateways.dummy.plugin.DummyGatewayPlugin",
+    "saleor.payment.gateways.dummy_credit_card.plugin.DummyCreditCardGatewayPlugin",
     "saleor.payment.gateways.stripe.plugin.StripeGatewayPlugin",
     "saleor.payment.gateways.braintree.plugin.BraintreeGatewayPlugin",
     "saleor.payment.gateways.razorpay.plugin.RazorpayGatewayPlugin",
+    "saleor.payment.gateways.adyen.plugin.AdyenGatewayPlugin",
+    "saleor.plugins.invoicing.plugin.InvoicingPlugin",
 ]
 
-# Whether DraftJS should be used be used instead of HTML
-# True to use DraftJS (JSON based), for the 2.0 dashboard
-# False to use the old editor from dashboard 1.0
-USE_JSON_CONTENT = get_bool_from_env("USE_JSON_CONTENT", False)
-JWT_TOKEN_SECRET = os.environ.get("JWT_TOKEN_SECRET", "saleor")
-if not DEBUG:
-    JWT_VERIFY_EXPIRATION = True
+# Plugin discovery
+installed_plugins = pkg_resources.iter_entry_points("saleor.plugins")
+for entry_point in installed_plugins:
+    plugin_path = "{}.{}".format(entry_point.module_name, entry_point.attrs[0])
+    if plugin_path not in PLUGINS:
+        if entry_point.name not in INSTALLED_APPS:
+            INSTALLED_APPS.append(entry_point.name)
+        PLUGINS.append(plugin_path)
+
+if (
+    not DEBUG
+    and ENABLE_ACCOUNT_CONFIRMATION_BY_EMAIL
+    and ALLOWED_CLIENT_HOSTS == get_list(_DEFAULT_CLIENT_HOSTS)
+):
+    raise ImproperlyConfigured(
+        "Make sure you've added storefront address to ALLOWED_CLIENT_HOSTS "
+        "if ENABLE_ACCOUNT_CONFIRMATION_BY_EMAIL is enabled."
+    )
+
+# Initialize a simple and basic Jaeger Tracing integration
+# for open-tracing if enabled.
+#
+# Refer to our guide on https://docs.saleor.io/docs/next/guides/opentracing-jaeger/.
+#
+# If running locally, set:
+#   JAEGER_AGENT_HOST=localhost
+if "JAEGER_AGENT_HOST" in os.environ:
+    jaeger_client.Config(
+        config={
+            "sampler": {"type": "const", "param": 1},
+            "local_agent": {
+                "reporting_port": os.environ.get(
+                    "JAEGER_AGENT_PORT", jaeger_client.config.DEFAULT_REPORTING_PORT
+                ),
+                "reporting_host": os.environ.get("JAEGER_AGENT_HOST"),
+            },
+            "logging": get_bool_from_env("JAEGER_LOGGING", False),
+        },
+        service_name="saleor",
+        validate=True,
+    ).initialize_tracer()
+
+
+# Some cloud providers (Heroku) export REDIS_URL variable instead of CACHE_URL
+REDIS_URL = os.environ.get("REDIS_URL")
+if REDIS_URL:
+    CACHE_URL = os.environ.setdefault("CACHE_URL", REDIS_URL)
+CACHES = {"default": django_cache_url.config()}
+
+# Default False because storefront and dashboard don't support expiration of token
+JWT_EXPIRE = get_bool_from_env("JWT_EXPIRE", False)
+JWT_TTL_ACCESS = timedelta(seconds=parse(os.environ.get("JWT_TTL_ACCESS", "5 minutes")))
+JWT_TTL_APP_ACCESS = timedelta(
+    seconds=parse(os.environ.get("JWT_TTL_APP_ACCESS", "5 minutes"))
+)
+JWT_TTL_REFRESH = timedelta(seconds=parse(os.environ.get("JWT_TTL_REFRESH", "30 days")))
+
+
+JWT_TTL_REQUEST_EMAIL_CHANGE = timedelta(
+    seconds=parse(os.environ.get("JWT_TTL_REQUEST_EMAIL_CHANGE", "1 hour")),
+)

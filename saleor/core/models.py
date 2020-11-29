@@ -1,9 +1,11 @@
 import datetime
+from typing import Any
 
-from django.contrib.postgres.fields import JSONField
 from django.db import models
+from django.db.models import JSONField  # type: ignore
 from django.db.models import F, Max, Q
 
+from . import JobStatus
 from .permissions import ProductPermissions
 from .utils.json_serializer import CustomJsonEncoder
 
@@ -69,37 +71,57 @@ class PublishableModel(models.Model):
     def is_visible(self):
         return self.is_published and (
             self.publication_date is None
-            or self.publication_date < datetime.date.today()
+            or self.publication_date <= datetime.date.today()
         )
 
 
 class ModelWithMetadata(models.Model):
-    private_meta = JSONField(
+    private_metadata = JSONField(
         blank=True, null=True, default=dict, encoder=CustomJsonEncoder
     )
-    meta = JSONField(blank=True, null=True, default=dict, encoder=CustomJsonEncoder)
+    metadata = JSONField(blank=True, null=True, default=dict, encoder=CustomJsonEncoder)
 
     class Meta:
         abstract = True
 
-    def get_private_meta(self, namespace: str, client: str) -> dict:
-        return self.private_meta.get(namespace, {}).get(client, {})
+    def get_value_from_private_metadata(self, key: str, default: Any = None) -> Any:
+        return self.private_metadata.get(key, default)
 
-    def store_private_meta(self, namespace: str, client: str, item: dict):
-        if namespace not in self.private_meta:
-            self.private_meta[namespace] = {}
-        self.private_meta[namespace][str(client)] = item
+    def store_value_in_private_metadata(self, items: dict):
+        if not self.private_metadata:
+            self.private_metadata = {}
+        self.private_metadata.update(items)
 
-    def clear_stored_private_meta_for_client(self, namespace: str, client: str):
-        self.private_meta.get(namespace, {}).pop(client, None)
+    def clear_private_metadata(self):
+        self.private_metadata = {}
 
-    def get_meta(self, namespace: str, client: str) -> dict:
-        return self.meta.get(namespace, {}).get(client, {})
+    def delete_value_from_private_metadata(self, key: str):
+        if key in self.private_metadata:
+            del self.private_metadata[key]
 
-    def store_meta(self, namespace: str, client: str, item: dict):
-        if namespace not in self.meta:
-            self.meta[namespace] = {}
-        self.meta[namespace][str(client)] = item
+    def get_value_from_metadata(self, key: str, default: Any = None) -> Any:
+        return self.metadata.get(key, default)
 
-    def clear_stored_meta_for_client(self, namespace: str, client: str):
-        self.meta.get(namespace, {}).pop(client, None)
+    def store_value_in_metadata(self, items: dict):
+        if not self.metadata:
+            self.metadata = {}
+        self.metadata.update(items)
+
+    def clear_metadata(self):
+        self.metadata = {}
+
+    def delete_value_from_metadata(self, key: str):
+        if key in self.metadata:
+            del self.metadata[key]
+
+
+class Job(models.Model):
+    status = models.CharField(
+        max_length=50, choices=JobStatus.CHOICES, default=JobStatus.PENDING
+    )
+    message = models.CharField(max_length=255, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        abstract = True

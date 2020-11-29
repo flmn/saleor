@@ -1,9 +1,9 @@
+import os
 from datetime import date
 
 from django.conf import settings
 from django.db import models
 from django.db.models import Q
-from django.utils.translation import pgettext_lazy
 from django_prices.models import MoneyField
 
 from ..core.permissions import GiftcardPermissions
@@ -35,7 +35,7 @@ class GiftCard(models.Model):
 
     currency = models.CharField(
         max_length=settings.DEFAULT_CURRENCY_CODE_LENGTH,
-        default=settings.DEFAULT_CURRENCY,
+        default=os.environ.get("DEFAULT_CURRENCY", "USD"),
     )
 
     initial_balance_amount = models.DecimalField(
@@ -57,11 +57,9 @@ class GiftCard(models.Model):
     objects = GiftCardQueryset.as_manager()
 
     class Meta:
+        ordering = ("code",)
         permissions = (
-            (
-                GiftcardPermissions.MANAGE_GIFT_CARD.codename,
-                pgettext_lazy("Permission description", "Manage gift cards."),
-            ),
+            (GiftcardPermissions.MANAGE_GIFT_CARD.codename, "Manage gift cards."),
         )
 
     @property

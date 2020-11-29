@@ -1,205 +1,139 @@
-from typing import TYPE_CHECKING
+from typing import Union
 
-import graphene_django_optimizer as gql_optimizer
 from django.db.models import Sum
-from graphql import GraphQLError
-from graphql_relay import from_global_id
+from promise import Promise
 
+from ...checkout.models import CheckoutLine
 from ...order import OrderStatus
+from ...order.models import OrderLine
 from ...product import models
-from ...search.backends import picker
-from ..core.enums import OrderDirection
-from ..utils import (
-    filter_by_period,
-    filter_by_query_param,
-    get_database_id,
-    get_user_or_service_account_from_context,
-    get_nodes,
-    sort_queryset,
+from ..channel import ChannelContext, ChannelQsContext
+from ..channel.dataloaders import (
+    ChannelByCheckoutLineIDLoader,
+    ChannelByOrderLineIdLoader,
 )
-from .filters import (
-    filter_attributes_by_product_types,
-    filter_products_by_attributes,
-    filter_products_by_categories,
-    filter_products_by_collections,
-    filter_products_by_minimal_price,
-    filter_products_by_price,
-    filter_products_by_stock_availability,
+from ..product.dataloaders import (
+    ProductChannelListingByProductIdAndChannelSlugLoader,
+    ProductVariantByIdLoader,
 )
-from .sorters import (
-    AttributeSortField,
-    CategorySortField,
-    CollectionSortField,
-    ProductOrder,
-    ProductOrderField,
-    ProductTypeSortField,
-)
-
-if TYPE_CHECKING:
-    from django.db.models.query import QuerySet
-
-PRODUCT_SEARCH_FIELDS = ("name", "description")
-PRODUCT_TYPE_SEARCH_FIELDS = ("name",)
-CATEGORY_SEARCH_FIELDS = ("name", "slug", "description", "parent__name")
-COLLECTION_SEARCH_FIELDS = ("name", "slug")
-ATTRIBUTES_SEARCH_FIELDS = ("name", "slug")
+from ..utils import get_database_id, get_user_or_app_from_context
+from ..utils.filters import filter_by_period
+from .filters import filter_products_by_stock_availability
 
 
-def resolve_attributes(
-    info,
-    qs=None,
-    in_category=None,
-    in_collection=None,
-    query=None,
-    sort_by=None,
-    **_kwargs,
-):
-    qs = qs or models.Attribute.objects.get_visible_to_user(info.context.user)
-    qs = filter_by_query_param(qs, query, ATTRIBUTES_SEARCH_FIELDS)
-
-    if in_category:
-        qs = filter_attributes_by_product_types(qs, "in_category", in_category)
-
-    if in_collection:
-        qs = filter_attributes_by_product_types(qs, "in_collection", in_collection)
-
-    if sort_by:
-        qs = sort_queryset(qs, sort_by, AttributeSortField)
-    else:
-        qs = qs.order_by("name")
-
-    qs = qs.distinct()
-    return gql_optimizer.query(qs, info)
+def resolve_category_by_slug(slug):
+    return models.Category.objects.filter(slug=slug).first()
 
 
-def resolve_categories(info, query, level=None, sort_by=None, **_kwargs):
+def resolve_categories(info, level=None, **_kwargs):
     qs = models.Category.objects.prefetch_related("children")
     if level is not None:
         qs = qs.filter(level=level)
-    qs = filter_by_query_param(qs, query, CATEGORY_SEARCH_FIELDS)
-    qs = sort_queryset(qs, sort_by, CategorySortField)
-    qs = qs.distinct()
-    return gql_optimizer.query(qs, info)
+    return qs.distinct()
 
 
-def resolve_collections(info, query, sort_by=None, **_kwargs):
+def resolve_collection_by_id(info, id, channel_slug, requestor):
+    return (
+        models.Collection.objects.visible_to_user(requestor, channel_slug=channel_slug)
+        .filter(id=id)
+        .first()
+    )
+
+
+def resolve_collection_by_slug(info, slug, channel_slug, requestor):
+    return (
+        models.Collection.objects.visible_to_user(requestor, channel_slug)
+        .filter(slug=slug)
+        .first()
+    )
+
+
+def resolve_collections(info, channel_slug):
     user = info.context.user
-    qs = models.Collection.objects.visible_to_user(user)
-    qs = filter_by_query_param(qs, query, COLLECTION_SEARCH_FIELDS)
-    qs = sort_queryset(qs, sort_by, CollectionSortField)
-    return gql_optimizer.query(qs, info)
+    qs = models.Collection.objects.visible_to_user(user, channel_slug)
+
+    return ChannelQsContext(qs=qs, channel_slug=channel_slug)
 
 
-def resolve_digital_contents(info):
-    qs = models.DigitalContent.objects.all()
-    return gql_optimizer.query(qs, info)
+def resolve_digital_contents(_info):
+    return models.DigitalContent.objects.all()
 
 
-def sort_products(qs: models.ProductsQueryset, sort_by: ProductOrder) -> "QuerySet":
-    if sort_by is None:
-        return qs
-
-    # Check if one of the required fields was provided
-    if sort_by.field and sort_by.attribute_id:
-        raise GraphQLError(
-            "You must provide either `field` or `attributeId` to sort the products."
-        )
-
-    if not sort_by.field and not sort_by.attribute_id:
-        return qs
-
-    if sort_by.field:
-        return sort_queryset(qs, sort_by, ProductOrderField)
-    return sort_products_by_attribute(qs, sort_by)
+def resolve_product_by_id(info, id, channel_slug, requestor):
+    return (
+        models.Product.objects.visible_to_user(requestor, channel_slug=channel_slug)
+        .filter(id=id)
+        .first()
+    )
 
 
-def sort_products_by_attribute(
-    qs: models.ProductsQueryset, sort_by: ProductOrder
-) -> models.ProductsQueryset:
-    direction = sort_by.direction
-
-    # If an attribute ID was passed, attempt to convert it
-    if sort_by.attribute_id:
-        graphene_type, attribute_pk = from_global_id(sort_by.attribute_id)
-        is_ascending = direction == OrderDirection.ASC
-
-        # If the passed attribute ID is valid, execute the sorting
-        if attribute_pk.isnumeric() and graphene_type == "Attribute":
-            qs = qs.sort_by_attribute(attribute_pk, ascending=is_ascending)
-
-    return qs
+def resolve_product_by_slug(info, product_slug, channel_slug, requestor):
+    return (
+        models.Product.objects.visible_to_user(requestor, channel_slug=channel_slug)
+        .filter(slug=product_slug)
+        .first()
+    )
 
 
 def resolve_products(
-    info,
-    attributes=None,
-    categories=None,
-    collections=None,
-    price_lte=None,
-    price_gte=None,
-    minimal_price_lte=None,
-    minimal_price_gte=None,
-    sort_by=None,
-    stock_availability=None,
-    query=None,
-    **_kwargs,
-):
-
-    user = get_user_or_service_account_from_context(info.context)
-    qs = models.Product.objects.visible_to_user(user)
-    qs = sort_products(qs, sort_by)
-
-    if query:
-        search = picker.pick_backend()
-        qs &= search(query)
-
-    if attributes:
-        qs = filter_products_by_attributes(qs, attributes)
-
-    if categories:
-        categories = get_nodes(categories, "Category", models.Category)
-        qs = filter_products_by_categories(qs, categories)
-
-    if collections:
-        collections = get_nodes(collections, "Collection", models.Collection)
-        qs = filter_products_by_collections(qs, collections)
-
+    info, requestor, stock_availability=None, channel_slug=None, **_kwargs
+) -> ChannelQsContext:
+    qs = models.Product.objects.visible_to_user(requestor, channel_slug)
     if stock_availability:
         qs = filter_products_by_stock_availability(qs, stock_availability)
-
-    qs = filter_products_by_price(qs, price_lte, price_gte)
-    qs = filter_products_by_minimal_price(qs, minimal_price_lte, minimal_price_gte)
-    qs = qs.distinct()
-
-    return gql_optimizer.query(qs, info)
-
-
-def resolve_product_types(info, query, sort_by=None, **_kwargs):
-    qs = models.ProductType.objects.all()
-    qs = filter_by_query_param(qs, query, PRODUCT_TYPE_SEARCH_FIELDS)
-    if sort_by:
-        qs = sort_queryset(qs, sort_by, ProductTypeSortField)
-    else:
-        qs = qs.order_by("name")
-    return gql_optimizer.query(qs, info)
+    if not qs.user_has_access_to_all(requestor):
+        qs = qs.annotate_visible_in_listings(channel_slug).exclude(
+            visible_in_listings=False
+        )
+    return ChannelQsContext(qs=qs.distinct(), channel_slug=channel_slug)
 
 
-def resolve_product_variants(info, ids=None):
-    user = info.context.user
-    visible_products = models.Product.objects.visible_to_user(user).values_list(
-        "pk", flat=True
+def resolve_variant_by_id(info, id, channel_slug, requestor):
+    visible_products = models.Product.objects.visible_to_user(
+        requestor, channel_slug
+    ).values_list("pk", flat=True)
+    qs = models.ProductVariant.objects.filter(product__id__in=visible_products)
+    return qs.filter(pk=id).first()
+
+
+def resolve_product_types(info, **_kwargs):
+    return models.ProductType.objects.all()
+
+
+def resolve_product_variant_by_sku(
+    info, sku, channel_slug, requestor, requestor_has_access_to_all
+):
+    visible_products = models.Product.objects.visible_to_user(requestor, channel_slug)
+    if not requestor_has_access_to_all:
+        visible_products = visible_products.annotate_visible_in_listings(
+            channel_slug
+        ).exclude(visible_in_listings=False)
+
+    return (
+        models.ProductVariant.objects.filter(product__id__in=visible_products)
+        .filter(sku=sku)
+        .first()
     )
+
+
+def resolve_product_variants(
+    info, requestor_has_access_to_all, requestor, ids=None, channel_slug=None
+) -> ChannelQsContext:
+    visible_products = models.Product.objects.visible_to_user(requestor, channel_slug)
+    if not requestor_has_access_to_all:
+        visible_products = visible_products.annotate_visible_in_listings(
+            channel_slug
+        ).exclude(visible_in_listings=False)
+
     qs = models.ProductVariant.objects.filter(product__id__in=visible_products)
     if ids:
         db_ids = [get_database_id(info, node_id, "ProductVariant") for node_id in ids]
         qs = qs.filter(pk__in=db_ids)
-    return gql_optimizer.query(qs, info)
+    return ChannelQsContext(qs=qs, channel_slug=channel_slug)
 
 
-def resolve_report_product_sales(period):
-    qs = models.ProductVariant.objects.prefetch_related(
-        "product", "product__images", "order_lines__order"
-    ).all()
+def resolve_report_product_sales(period, channel_slug) -> ChannelQsContext:
+    qs = models.ProductVariant.objects.all()
 
     # exclude draft and canceled orders
     exclude_status = [OrderStatus.DRAFT, OrderStatus.CANCELED]
@@ -209,5 +143,46 @@ def resolve_report_product_sales(period):
     qs = filter_by_period(qs, period, "order_lines__order__created")
 
     qs = qs.annotate(quantity_ordered=Sum("order_lines__quantity"))
-    qs = qs.filter(quantity_ordered__isnull=False)
-    return qs.order_by("-quantity_ordered")
+    qs = qs.filter(
+        quantity_ordered__isnull=False, order_lines__order__channel__slug=channel_slug
+    )
+    qs = qs.order_by("-quantity_ordered")
+    return ChannelQsContext(qs=qs, channel_slug=channel_slug)
+
+
+def resolve_variant(
+    info,
+    root: Union[CheckoutLine, OrderLine],
+    channel_dataloader: Union[
+        ChannelByCheckoutLineIDLoader, ChannelByOrderLineIdLoader
+    ],
+):
+    context = info.context
+    if not root.variant_id:
+        return None
+
+    def requestor_has_access_to_variant(data):
+        variant, channel = data
+
+        def product_is_available(product_channel_listing):
+            if not product_channel_listing:
+                return None
+            requester = get_user_or_app_from_context(context)
+            visible_in_listings = product_channel_listing.visible_in_listings
+            requestor_has_access_to_all = models.Product.objects.user_has_access_to_all(
+                requester
+            )
+            if visible_in_listings or requestor_has_access_to_all:
+                return ChannelContext(node=variant, channel_slug=channel.slug)
+            return None
+
+        return (
+            ProductChannelListingByProductIdAndChannelSlugLoader(context)
+            .load((variant.product_id, channel.slug))
+            .then(product_is_available)
+        )
+
+    variant = ProductVariantByIdLoader(context).load(root.variant_id)
+    channel = channel_dataloader.load(root.id)
+
+    return Promise.all([variant, channel]).then(requestor_has_access_to_variant)

@@ -7,7 +7,7 @@ from ...core.utils import build_absolute_uri
 from ...core.utils.json_serializer import HTMLSafeJSON
 
 if TYPE_CHECKING:
-    from ...order.models import OrderLine, Order
+    from ...order.models import Order, OrderLine
 
 
 def get_organization():
@@ -37,10 +37,6 @@ def get_product_data(line: "OrderLine", organization: dict) -> dict:
         return {}
 
     product = line.variant.product
-    # Deprecated. To remove in #5022
-    product_url = build_absolute_uri(product.get_absolute_url())
-    product_data["itemOffered"]["url"] = product_url
-
     product_image = product.get_first_image()
     if product_image:
         image = product_image.image
@@ -51,8 +47,6 @@ def get_product_data(line: "OrderLine", organization: dict) -> dict:
 def get_order_confirmation_markup(order: "Order") -> str:
     """Generate schema.org markup for order confirmation e-mail message."""
     organization = get_organization()
-    # Deprecated. To remove in #5022
-    order_url = build_absolute_uri(order.get_absolute_url())
     data = {
         "@context": "http://schema.org",
         "@type": "Order",
@@ -61,14 +55,11 @@ def get_order_confirmation_markup(order: "Order") -> str:
         "priceCurrency": order.total.gross.currency,
         "price": order.total.gross.amount,
         "acceptedOffer": [],
-        "url": order_url,
-        "potentialAction": {"@type": "ViewAction", "url": order_url},
         "orderStatus": "http://schema.org/OrderProcessing",
         "orderDate": order.created,
     }
 
-    lines = order.lines.prefetch_related("variant")
-    for line in lines:
+    for line in order.lines.all():
         product_data = get_product_data(line=line, organization=organization)
         data["acceptedOffer"].append(product_data)
     return json.dumps(data, cls=HTMLSafeJSON)

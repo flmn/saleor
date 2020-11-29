@@ -1,6 +1,7 @@
 import graphene
 from django_prices.templatetags import prices
 
+from ....core.prices import quantize_price
 from ..enums import TaxRateType
 
 
@@ -10,13 +11,18 @@ class Money(graphene.ObjectType):
     localized = graphene.String(
         description="Money formatted according to the current locale.",
         required=True,
-        deprecation_reason="DEPRECATED: Will be removed in Saleor 2.11. "
-        "Price formatting according to the current locale should be "
-        "handled by the frontend client.",
+        deprecation_reason=(
+            "Price formatting according to the current locale should be handled by the "
+            "frontend client. This field will be removed after 2020-07-31."
+        ),
     )
 
     class Meta:
         description = "Represents amount of money in specific currency."
+
+    @staticmethod
+    def resolve_amount(root, _info):
+        return quantize_price(root.amount, root.currency)
 
     @staticmethod
     def resolve_localized(root, _info):

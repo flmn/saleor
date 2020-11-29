@@ -1,15 +1,12 @@
 import json
 from typing import Callable
 
-from django.contrib.postgres.fields.jsonb import JSONField
-from django.utils.translation import gettext_lazy
+from django.db.models import JSONField  # type: ignore
 
 
 class SanitizedJSONField(JSONField):
-    description = gettext_lazy(
-        "A JSON field that runs a given sanitization method "
-        "before saving into the database."
-    )
+    description = "A JSON field that runs a given sanitization method "
+    "before saving into the database."
 
     def __init__(self, *args, sanitizer: Callable[[dict], dict], **kwargs):
         super(SanitizedJSONField, self).__init__(*args, **kwargs)

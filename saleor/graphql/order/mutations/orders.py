@@ -1,10 +1,11 @@
 import graphene
 from django.core.exceptions import ValidationError
+from django.db import transaction
 
 from ....account.models import User
 from ....core.permissions import OrderPermissions
 from ....core.taxes import zero_taxed_money
-from ....order import events, models
+from ....order import OrderStatus, events, models
 from ....order.actions import (
     cancel_order,
     clean_mark_order_as_paid,
@@ -15,18 +16,14 @@ from ....order.actions import (
     order_voided,
 )
 from ....order.error_codes import OrderErrorCode
-from ....order.utils import get_valid_shipping_methods_for_order
-from ....payment import CustomPaymentChoices, PaymentError, gateway
+from ....order.utils import get_valid_shipping_methods_for_order, update_order_prices
+from ....payment import CustomPaymentChoices, PaymentError, TransactionKind, gateway
 from ...account.types import AddressInput
-from ...core.mutations import (
-    BaseMutation,
-    ClearMetaBaseMutation,
-    UpdateMetaBaseMutation,
-)
-from ...core.scalars import Decimal
-from ...core.types import MetaInput, MetaPath
+from ...core.mutations import BaseMutation
+from ...core.scalars import PositiveDecimal
 from ...core.types.common import OrderError
-from ...order.mutations.draft_orders import DraftOrderUpdate
+from ...core.utils import validate_required_string_field
+from ...order.mutations.draft_orders import DraftOrderCreate
 from ...order.types import Order, OrderEvent
 from ...shipping.types import ShippingMethod
 
@@ -123,7 +120,7 @@ def clean_refund_payment(payment):
 
 def try_payment_action(order, user, payment, func, *args, **kwargs):
     try:
-        func(*args, **kwargs)
+        return func(*args, **kwargs)
     except (PaymentError, ValueError) as e:
         message = str(e)
         events.payment_failed_event(
@@ -132,7 +129,6 @@ def try_payment_action(order, user, payment, func, *args, **kwargs):
         raise ValidationError(
             {"payment": ValidationError(message, code=OrderErrorCode.PAYMENT_ERROR)}
         )
-    return True
 
 
 class OrderUpdateInput(graphene.InputObjectType):
@@ -141,7 +137,7 @@ class OrderUpdateInput(graphene.InputObjectType):
     shipping_address = AddressInput(description="Shipping address of the customer.")
 
 
-class OrderUpdate(DraftOrderUpdate):
+class OrderUpdate(DraftOrderCreate):
     class Arguments:
         id = graphene.ID(required=True, description="ID of an order to update.")
         input = OrderUpdateInput(
@@ -168,12 +164,29 @@ class OrderUpdate(DraftOrderUpdate):
         return cleaned_input
 
     @classmethod
+    def get_instance(cls, info, **data):
+        instance = super().get_instance(info, **data)
+        if instance.status == OrderStatus.DRAFT:
+            raise ValidationError(
+                {
+                    "id": ValidationError(
+                        "Provided order id belongs to draft order. "
+                        "Use `draftOrderUpdate` mutation instead.",
+                        code=OrderErrorCode.INVALID,
+                    )
+                }
+            )
+        return instance
+
+    @classmethod
+    @transaction.atomic
     def save(cls, info, instance, cleaned_input):
-        super().save(info, instance, cleaned_input)
+        cls._save_addresses(info, instance, cleaned_input)
         if instance.user_email:
             user = User.objects.filter(email=instance.user_email).first()
             instance.user = user
         instance.save()
+        info.context.plugins.order_updated(instance)
 
 
 class OrderUpdateShippingInput(graphene.InputObjectType):
@@ -218,7 +231,7 @@ class OrderUpdateShipping(BaseMutation):
                 )
 
             order.shipping_method = None
-            order.shipping_price = zero_taxed_money()
+            order.shipping_price = zero_taxed_money(order.currency)
             order.shipping_method_name = None
             order.save(
                 update_fields=[
@@ -241,7 +254,7 @@ class OrderUpdateShipping(BaseMutation):
         clean_order_update_shipping(order, method)
 
         order.shipping_method = method
-        order.shipping_price = info.context.extensions.calculate_order_shipping(order)
+        order.shipping_price = info.context.plugins.calculate_order_shipping(order)
         order.shipping_method_name = method.name
         order.save(
             update_fields=[
@@ -252,13 +265,16 @@ class OrderUpdateShipping(BaseMutation):
                 "shipping_price_gross_amount",
             ]
         )
+        update_order_prices(order, info.context.discounts)
         # Post-process the results
         order_shipping_updated(order)
         return OrderUpdateShipping(order=order)
 
 
 class OrderAddNoteInput(graphene.InputObjectType):
-    message = graphene.String(description="Note message.", name="message")
+    message = graphene.String(
+        description="Note message.", name="message", required=True
+    )
 
 
 class OrderAddNote(BaseMutation):
@@ -282,10 +298,25 @@ class OrderAddNote(BaseMutation):
         error_type_field = "order_errors"
 
     @classmethod
+    def clean_input(cls, _info, _instance, data):
+        try:
+            cleaned_input = validate_required_string_field(data["input"], "message")
+        except ValidationError:
+            raise ValidationError(
+                {
+                    "message": ValidationError(
+                        "Message can't be empty.", code=OrderErrorCode.REQUIRED,
+                    )
+                }
+            )
+        return cleaned_input
+
+    @classmethod
     def perform_mutation(cls, _root, info, **data):
         order = cls.get_node_or_error(info, data.get("id"), only_type=Order)
+        cleaned_input = cls.clean_input(info, order, data)
         event = events.order_note_added_event(
-            order=order, user=info.context.user, message=data.get("input")["message"]
+            order=order, user=info.context.user, message=cleaned_input["message"],
         )
         return OrderAddNote(order=order, event=event)
 
@@ -295,9 +326,6 @@ class OrderCancel(BaseMutation):
 
     class Arguments:
         id = graphene.ID(required=True, description="ID of the order to cancel.")
-        restock = graphene.Boolean(
-            required=True, description="Determine if lines will be restocked or not."
-        )
 
     class Meta:
         description = "Cancel an order."
@@ -306,10 +334,10 @@ class OrderCancel(BaseMutation):
         error_type_field = "order_errors"
 
     @classmethod
-    def perform_mutation(cls, _root, info, restock, **data):
+    def perform_mutation(cls, _root, info, **data):
         order = cls.get_node_or_error(info, data.get("id"), only_type=Order)
         clean_order_cancel(order)
-        cancel_order(order=order, user=info.context.user, restock=restock)
+        cancel_order(order=order, user=info.context.user)
         return OrderCancel(order=order)
 
 
@@ -318,6 +346,9 @@ class OrderMarkAsPaid(BaseMutation):
 
     class Arguments:
         id = graphene.ID(required=True, description="ID of the order to mark paid.")
+        transaction_reference = graphene.String(
+            required=False, description="The external transaction reference."
+        )
 
     class Meta:
         description = "Mark order as manually paid."
@@ -326,14 +357,23 @@ class OrderMarkAsPaid(BaseMutation):
         error_type_field = "order_errors"
 
     @classmethod
+    def clean_billing_address(cls, instance):
+        if not instance.billing_address:
+            raise ValidationError(
+                "Order billing address is required to mark order as paid.",
+                code=OrderErrorCode.BILLING_ADDRESS_NOT_SET,
+            )
+
+    @classmethod
     def perform_mutation(cls, _root, info, **data):
         order = cls.get_node_or_error(info, data.get("id"), only_type=Order)
-
+        transaction_reference = data.get("transaction_reference")
+        cls.clean_billing_address(order)
         try_payment_action(
             order, info.context.user, None, clean_mark_order_as_paid, order
         )
 
-        mark_order_as_paid(order, info.context.user)
+        mark_order_as_paid(order, info.context.user, transaction_reference)
         return OrderMarkAsPaid(order=order)
 
 
@@ -342,7 +382,9 @@ class OrderCapture(BaseMutation):
 
     class Arguments:
         id = graphene.ID(required=True, description="ID of the order to capture.")
-        amount = Decimal(required=True, description="Amount of money to capture.")
+        amount = PositiveDecimal(
+            required=True, description="Amount of money to capture."
+        )
 
     class Meta:
         description = "Capture an order."
@@ -366,11 +408,13 @@ class OrderCapture(BaseMutation):
         payment = order.get_last_payment()
         clean_order_capture(payment)
 
-        try_payment_action(
+        transaction = try_payment_action(
             order, info.context.user, payment, gateway.capture, payment, amount
         )
-
-        order_captured(order, info.context.user, amount, payment)
+        # Confirm that we changed the status to capture. Some payment can receive
+        # asynchronous webhook with update status
+        if transaction.kind == TransactionKind.CAPTURE:
+            order_captured(order, info.context.user, amount, payment)
         return OrderCapture(order=order)
 
 
@@ -392,8 +436,13 @@ class OrderVoid(BaseMutation):
         payment = order.get_last_payment()
         clean_void_payment(payment)
 
-        try_payment_action(order, info.context.user, payment, gateway.void, payment)
-        order_voided(order, info.context.user, payment)
+        transaction = try_payment_action(
+            order, info.context.user, payment, gateway.void, payment
+        )
+        # Confirm that we changed the status to void. Some payment can receive
+        # asynchronous webhook with update status
+        if transaction.kind == TransactionKind.VOID:
+            order_voided(order, info.context.user, payment)
         return OrderVoid(order=order)
 
 
@@ -402,7 +451,9 @@ class OrderRefund(BaseMutation):
 
     class Arguments:
         id = graphene.ID(required=True, description="ID of the order to refund.")
-        amount = Decimal(required=True, description="Amount of money to refund.")
+        amount = PositiveDecimal(
+            required=True, description="Amount of money to refund."
+        )
 
     class Meta:
         description = "Refund an order."
@@ -426,66 +477,12 @@ class OrderRefund(BaseMutation):
         payment = order.get_last_payment()
         clean_refund_payment(payment)
 
-        try_payment_action(
+        transaction = try_payment_action(
             order, info.context.user, payment, gateway.refund, payment, amount
         )
 
-        order_refunded(order, info.context.user, amount, payment)
+        # Confirm that we changed the status to refund. Some payment can receive
+        # asynchronous webhook with update status
+        if transaction.kind == TransactionKind.REFUND:
+            order_refunded(order, info.context.user, amount, payment)
         return OrderRefund(order=order)
-
-
-class OrderUpdateMeta(UpdateMetaBaseMutation):
-    class Meta:
-        description = "Updates meta for order."
-        model = models.Order
-        public = True
-
-    class Arguments:
-        token = graphene.UUID(
-            description="Token of an object to update.", required=True
-        )
-        input = MetaInput(
-            description="Fields required to update new or stored metadata item.",
-            required=True,
-        )
-
-    @classmethod
-    def get_instance(cls, info, **data):
-        token = data["token"]
-        return models.Order.objects.get(token=token)
-
-
-class OrderUpdatePrivateMeta(UpdateMetaBaseMutation):
-    class Meta:
-        description = "Updates private meta for order."
-        model = models.Order
-        permissions = (OrderPermissions.MANAGE_ORDERS,)
-        public = False
-
-
-class OrderClearMeta(ClearMetaBaseMutation):
-    class Meta:
-        description = "Clears stored metadata value."
-        model = models.Order
-        permissions = (OrderPermissions.MANAGE_ORDERS,)
-        public = True
-
-    class Arguments:
-        token = graphene.UUID(description="Token of an object to clear.", required=True)
-        input = MetaPath(
-            description="Fields required to update new or stored metadata item.",
-            required=True,
-        )
-
-    @classmethod
-    def get_instance(cls, info, **data):
-        token = data["token"]
-        return models.Order.objects.get(token=token)
-
-
-class OrderClearPrivateMeta(ClearMetaBaseMutation):
-    class Meta:
-        description = "Clears stored private metadata value."
-        model = models.Order
-        permissions = (OrderPermissions.MANAGE_ORDERS,)
-        public = False

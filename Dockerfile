@@ -12,58 +12,51 @@ COPY requirements_dev.txt /app/
 WORKDIR /app
 RUN pip install -r requirements_dev.txt
 
-### Build static assets
-FROM node:10 as build-nodejs
-
-ARG STATIC_URL
-ENV STATIC_URL ${STATIC_URL:-/static/}
-
-# Install node_modules
-COPY app.json package.json package-lock.json /app/
-WORKDIR /app
-RUN npm install
-
-# Build static
-COPY ./saleor/static /app/saleor/static/
-COPY ./templates /app/templates/
-RUN STATIC_URL=${STATIC_URL} npm run build-emails --production
-
 ### Final image
 FROM python:3.8-slim
-
-ARG STATIC_URL
-ENV STATIC_URL ${STATIC_URL:-/static/}
 
 RUN groupadd -r saleor && useradd -r -g saleor saleor
 
 RUN apt-get update \
   && apt-get install -y \
-    libxml2 \
-    libssl1.1 \
-    libcairo2 \
-    libpango-1.0-0 \
-    libpangocairo-1.0-0 \
-    libgdk-pixbuf2.0-0 \
-    shared-mime-info \
-    mime-support \
+  libxml2 \
+  libssl1.1 \
+  libcairo2 \
+  libpango-1.0-0 \
+  libpangocairo-1.0-0 \
+  libgdk-pixbuf2.0-0 \
+  shared-mime-info \
+  mime-support \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
-
-COPY . /app
-COPY --from=build-python /usr/local/lib/python3.8/site-packages/ /usr/local/lib/python3.8/site-packages/
-COPY --from=build-python /usr/local/bin/ /usr/local/bin/
-COPY --from=build-nodejs /app/saleor/static /app/saleor/static
-COPY --from=build-nodejs /app/templates /app/templates
-WORKDIR /app
-
-RUN SECRET_KEY=dummy STATIC_URL=${STATIC_URL} python3 manage.py collectstatic --no-input
 
 RUN mkdir -p /app/media /app/static \
   && chown -R saleor:saleor /app/
 
-EXPOSE 8000
-ENV PORT 8000
-ENV PYTHONUNBUFFERED 1
-ENV PROCESSES 4
+COPY --from=build-python /usr/local/lib/python3.8/site-packages/ /usr/local/lib/python3.8/site-packages/
+COPY --from=build-python /usr/local/bin/ /usr/local/bin/
+COPY . /app
+WORKDIR /app
 
-CMD ["uwsgi", "--ini", "/app/saleor/wsgi/uwsgi.ini"]
+ARG STATIC_URL
+ENV STATIC_URL ${STATIC_URL:-/static/}
+RUN SECRET_KEY=dummy STATIC_URL=${STATIC_URL} python3 manage.py collectstatic --no-input
+
+EXPOSE 8000
+ENV PYTHONUNBUFFERED 1
+
+ARG COMMIT_ID
+ARG VERSION
+
+LABEL org.opencontainers.image.title="mirumee/saleor"                                  \
+      org.opencontainers.image.description="\
+A modular, high performance, headless e-commerce platform built with Python, \
+GraphQL, Django, and ReactJS."                                                         \
+      org.opencontainers.image.url="https://saleor.io/"                                \
+      org.opencontainers.image.source="https://github.com/mirumee/saleor"              \
+      org.opencontainers.image.revision=$COMMIT_ID                                     \
+      org.opencontainers.image.version=$VERSION                                        \
+      org.opencontainers.image.authors="Mirumee Software (https://mirumee.com)"        \
+      org.opencontainers.image.licenses="BSD 3"
+
+CMD ["gunicorn", "--bind", ":8000", "--workers", "4", "--worker-class", "uvicorn.workers.UvicornWorker", "saleor.asgi:application"]

@@ -2,23 +2,22 @@ from itertools import chain
 from typing import Optional
 
 import graphene
-import graphene_django_optimizer as gql_optimizer
-from django.db.models import QuerySet
-from graphql_jwt.exceptions import PermissionDenied
+from django.contrib.auth import models as auth_models
 from i18naddress import get_validation_rules
 
 from ...account import models
+from ...core.exceptions import PermissionDenied
 from ...core.permissions import AccountPermissions
 from ...payment import gateway
 from ...payment.utils import fetch_customer_id
-from ..utils import (
-    filter_by_query_param,
-    get_user_or_service_account_from_context,
-    sort_queryset,
-)
-from .sorters import ServiceAccountSortField, UserSortField, UserSortingInput
+from ..utils import format_permissions_for_display, get_user_or_app_from_context
+from ..utils.filters import filter_by_query_param
 from .types import AddressValidationData, ChoiceValue
-from .utils import get_allowed_fields_camel_case, get_required_fields_camel_case
+from .utils import (
+    get_allowed_fields_camel_case,
+    get_required_fields_camel_case,
+    get_user_permissions,
+)
 
 USER_SEARCH_FIELDS = (
     "email",
@@ -31,34 +30,28 @@ USER_SEARCH_FIELDS = (
 )
 
 
-def sort_users(qs: QuerySet, sort_by: UserSortingInput) -> QuerySet:
-    if sort_by:
-        return sort_queryset(qs, sort_by, UserSortField)
-    return qs.order_by("email")
-
-
-def resolve_customers(info, query, sort_by=None, **_kwargs):
+def resolve_customers(info, query, **_kwargs):
     qs = models.User.objects.customers()
     qs = filter_by_query_param(
         queryset=qs, query=query, search_fields=USER_SEARCH_FIELDS
     )
-    qs = sort_users(qs, sort_by)
-    qs = qs.distinct()
-    return gql_optimizer.query(qs, info)
+    return qs.distinct()
 
 
-def resolve_staff_users(info, query, sort_by=None, **_kwargs):
+def resolve_permission_groups(info, **_kwargs):
+    return auth_models.Group.objects.all()
+
+
+def resolve_staff_users(info, query, **_kwargs):
     qs = models.User.objects.staff()
     qs = filter_by_query_param(
         queryset=qs, query=query, search_fields=USER_SEARCH_FIELDS
     )
-    qs = sort_users(qs, sort_by)
-    qs = qs.distinct()
-    return gql_optimizer.query(qs, info)
+    return qs.distinct()
 
 
 def resolve_user(info, id):
-    requester = get_user_or_service_account_from_context(info.context)
+    requester = get_user_or_app_from_context(info.context)
     if requester:
         _model, user_pk = graphene.Node.from_global_id(id)
         if requester.has_perms(
@@ -70,12 +63,6 @@ def resolve_user(info, id):
         if requester.has_perm(AccountPermissions.MANAGE_USERS):
             return models.User.objects.customers().filter(pk=user_pk).first()
     return PermissionDenied()
-
-
-def resolve_service_accounts(info, sort_by=None, **_kwargs):
-    qs = models.ServiceAccount.objects.all()
-    qs = sort_queryset(qs, sort_by, ServiceAccountSortField)
-    return gql_optimizer.query(qs, info)
 
 
 def resolve_address_validation_rules(
@@ -122,8 +109,7 @@ def resolve_address_validation_rules(
 
 def resolve_payment_sources(user: models.User):
     stored_customer_accounts = (
-        (gtw["name"], fetch_customer_id(user, gtw["name"]))
-        for gtw in gateway.list_gateways()
+        (gtw.id, fetch_customer_id(user, gtw.id)) for gtw in gateway.list_gateways()
     )
     return list(
         chain(
@@ -158,10 +144,16 @@ def prepare_graphql_payment_sources_type(payment_sources):
 
 def resolve_address(info, id):
     user = info.context.user
-    service_account = info.context.service_account
+    app = info.context.app
     _model, address_pk = graphene.Node.from_global_id(id)
-    if service_account and service_account.has_perm(AccountPermissions.MANAGE_USERS):
+    if app and app.has_perm(AccountPermissions.MANAGE_USERS):
         return models.Address.objects.filter(pk=address_pk).first()
     if user and not user.is_anonymous:
         return user.addresses.filter(id=address_pk).first()
     return PermissionDenied()
+
+
+def resolve_permissions(root: models.User):
+    permissions = get_user_permissions(root)
+    permissions = permissions.order_by("codename")
+    return format_permissions_for_display(permissions)

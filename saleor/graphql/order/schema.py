@@ -1,9 +1,9 @@
 import graphene
-from graphql_jwt.decorators import login_required
 
 from ...core.permissions import OrderPermissions
 from ..core.enums import ReportingPeriod
 from ..core.fields import FilterInputConnectionField, PrefetchingConnectionField
+from ..core.scalars import UUID
 from ..core.types import FilterInputObjectType, TaxedMoney
 from ..decorators import permission_required
 from .bulk_mutations.draft_orders import DraftOrderBulkDelete, DraftOrderLinesBulkDelete
@@ -21,24 +21,16 @@ from .mutations.draft_orders import (
 )
 from .mutations.fulfillments import (
     FulfillmentCancel,
-    FulfillmentClearMeta,
-    FulfillmentClearPrivateMeta,
-    FulfillmentCreate,
-    FulfillmentUpdateMeta,
-    FulfillmentUpdatePrivateMeta,
     FulfillmentUpdateTracking,
+    OrderFulfill,
 )
 from .mutations.orders import (
     OrderAddNote,
     OrderCancel,
     OrderCapture,
-    OrderClearMeta,
-    OrderClearPrivateMeta,
     OrderMarkAsPaid,
     OrderRefund,
     OrderUpdate,
-    OrderUpdateMeta,
-    OrderUpdatePrivateMeta,
     OrderUpdateShipping,
     OrderVoid,
 )
@@ -84,18 +76,19 @@ class OrderQueries(graphene.ObjectType):
         created=graphene.Argument(
             ReportingPeriod,
             description=(
-                "Filter orders from a selected timespan. "
-                "DEPRECATED: Will be removed in Saleor 2.11, "
-                "use the `filter` field instead."
+                "[Deprecated] Filter orders from a selected timespan. Use the `filter` "
+                "field instead. This field will be removed after 2020-07-31."
             ),
         ),
         status=graphene.Argument(
             OrderStatusFilter,
             description=(
-                "Filter order by status. "
-                "DEPRECATED: Will be removed in Saleor 2.11, "
-                "use the `filter` field instead."
+                "[Deprecated] Filter order by status. Use the `filter` field instead. "
+                "This field will be removed after 2020-07-31."
             ),
+        ),
+        channel=graphene.String(
+            description="Slug of a channel for which the data should be returned."
         ),
         description="List of orders.",
     )
@@ -106,9 +99,8 @@ class OrderQueries(graphene.ObjectType):
         created=graphene.Argument(
             ReportingPeriod,
             description=(
-                "Filter draft orders from a selected timespan. "
-                "DEPRECATED: Will be removed in Saleor 2.11, "
-                "use the `filter` field instead."
+                "[Deprecated] Filter draft orders from a selected timespan. Use the "
+                "`filter` field instead. This field will be removed after 2020-07-31."
             ),
         ),
         description="List of draft orders.",
@@ -117,38 +109,36 @@ class OrderQueries(graphene.ObjectType):
         TaxedMoney,
         description="Return the total sales amount from a specific period.",
         period=graphene.Argument(ReportingPeriod, description="A period of time."),
+        channel=graphene.Argument(
+            graphene.String,
+            description="Slug of a channel for which the data should be returned.",
+        ),
     )
     order_by_token = graphene.Field(
         Order,
         description="Look up an order by token.",
-        token=graphene.Argument(
-            graphene.UUID, description="The order's token.", required=True
-        ),
+        token=graphene.Argument(UUID, description="The order's token.", required=True),
     )
 
     @permission_required(OrderPermissions.MANAGE_ORDERS)
     def resolve_homepage_events(self, *_args, **_kwargs):
         return resolve_homepage_events()
 
-    @login_required
+    @permission_required(OrderPermissions.MANAGE_ORDERS)
     def resolve_order(self, info, **data):
         return resolve_order(info, data.get("id"))
 
     @permission_required(OrderPermissions.MANAGE_ORDERS)
-    def resolve_orders(
-        self, info, created=None, status=None, query=None, sort_by=None, **_kwargs
-    ):
-        return resolve_orders(info, created, status, query, sort_by)
+    def resolve_orders(self, info, created=None, status=None, channel=None, **_kwargs):
+        return resolve_orders(info, created, status, channel)
 
     @permission_required(OrderPermissions.MANAGE_ORDERS)
-    def resolve_draft_orders(
-        self, info, created=None, query=None, sort_by=None, **_kwargs
-    ):
-        return resolve_draft_orders(info, created, query, sort_by)
+    def resolve_draft_orders(self, info, created=None, **_kwargs):
+        return resolve_draft_orders(info, created)
 
     @permission_required(OrderPermissions.MANAGE_ORDERS)
-    def resolve_orders_total(self, info, period, **_kwargs):
-        return resolve_orders_total(info, period)
+    def resolve_orders_total(self, info, period, channel=None, **_kwargs):
+        return resolve_orders_total(info, period, channel)
 
     def resolve_order_by_token(self, _info, token):
         return resolve_order_by_token(token)
@@ -168,21 +158,12 @@ class OrderMutations(graphene.ObjectType):
     order_add_note = OrderAddNote.Field()
     order_cancel = OrderCancel.Field()
     order_capture = OrderCapture.Field()
-    order_clear_private_meta = OrderClearPrivateMeta.Field()
-    order_clear_meta = OrderClearMeta.Field()
+    order_fulfill = OrderFulfill.Field()
     order_fulfillment_cancel = FulfillmentCancel.Field()
-    order_fulfillment_create = FulfillmentCreate.Field()
     order_fulfillment_update_tracking = FulfillmentUpdateTracking.Field()
-    order_fulfillment_clear_meta = FulfillmentClearMeta.Field()
-    order_fulfillment_clear_private_meta = FulfillmentClearPrivateMeta.Field()
-    order_fulfillment_update_meta = FulfillmentUpdateMeta.Field()
-    order_fulfillment_update_private_meta = FulfillmentUpdatePrivateMeta.Field()
     order_mark_as_paid = OrderMarkAsPaid.Field()
     order_refund = OrderRefund.Field()
     order_update = OrderUpdate.Field()
-    order_update_meta = OrderUpdateMeta.Field()
-    order_update_private_meta = OrderUpdatePrivateMeta.Field()
     order_update_shipping = OrderUpdateShipping.Field()
     order_void = OrderVoid.Field()
-
     order_bulk_cancel = OrderBulkCancel.Field()

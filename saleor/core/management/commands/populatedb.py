@@ -1,6 +1,7 @@
 from io import StringIO
 
 from django.apps import apps
+from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import BaseCommand
 from django.db import connection
@@ -8,16 +9,19 @@ from django.db import connection
 from ....account.utils import create_superuser
 from ...utils.random_data import (
     add_address_to_admin,
+    create_channels,
     create_gift_card,
     create_menus,
     create_orders,
     create_page,
+    create_page_type,
+    create_permission_groups,
     create_product_sales,
     create_products_by_schema,
     create_shipping_zones,
     create_users,
     create_vouchers,
-    set_homepage_collection,
+    create_warehouses,
 )
 
 
@@ -83,9 +87,24 @@ class Command(BaseCommand):
             cursor.execute(commands.getvalue())
 
     def handle(self, *args, **options):
+        # set only our custom plugin to not call external API when preparing
+        # example database
+        settings.PLUGINS = [
+            "saleor.payment.gateways.dummy.plugin.DummyGatewayPlugin",
+            "saleor.payment.gateways.dummy_credit_card.plugin."
+            "DummyCreditCardGatewayPlugin",
+        ]
         self.make_database_faster()
         create_images = not options["withoutimages"]
+        for msg in create_channels():
+            self.stdout.write(msg)
         for msg in create_shipping_zones():
+            self.stdout.write(msg)
+        create_warehouses()
+        self.stdout.write("Created warehouses")
+        for msg in create_page_type():
+            self.stdout.write(msg)
+        for msg in create_page():
             self.stdout.write(msg)
         create_products_by_schema(self.placeholders_dir, create_images)
         self.stdout.write("Created products")
@@ -99,8 +118,6 @@ class Command(BaseCommand):
             self.stdout.write(msg)
         for msg in create_orders(20):
             self.stdout.write(msg)
-        for msg in set_homepage_collection():
-            self.stdout.write(msg)
         for msg in create_page():
             self.stdout.write(msg)
         for msg in create_menus():
@@ -113,3 +130,6 @@ class Command(BaseCommand):
             add_address_to_admin(credentials["email"])
         if not options["skipsequencereset"]:
             self.sequence_reset()
+
+        for msg in create_permission_groups():
+            self.stdout.write(msg)

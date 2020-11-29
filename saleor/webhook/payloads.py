@@ -1,14 +1,22 @@
 import json
-from typing import Optional
+from typing import Iterable, Optional
 
 from django.db.models import QuerySet
 
 from ..account.models import User
 from ..checkout.models import Checkout
+from ..core.utils.anonymization import (
+    anonymize_checkout,
+    anonymize_order,
+    generate_fake_user,
+)
+from ..invoice.models import Invoice
 from ..order import FulfillmentStatus, OrderStatus
-from ..order.models import Order
+from ..order.models import Fulfillment, FulfillmentLine, Order, OrderLine
+from ..order.utils import get_order_country
 from ..payment import ChargeStatus
 from ..product.models import Product
+from ..warehouse.models import Warehouse
 from .event_types import WebhookEventType
 from .payload_serializers import PayloadSerializer
 from .serializers import serialize_checkout_lines
@@ -27,31 +35,27 @@ ADDRESS_FIELDS = (
     "phone",
 )
 
+ORDER_FIELDS = (
+    "created",
+    "status",
+    "user_email",
+    "shipping_method_name",
+    "shipping_price_net_amount",
+    "shipping_price_gross_amount",
+    "total_net_amount",
+    "total_gross_amount",
+    "shipping_price_net_amount",
+    "shipping_price_gross_amount",
+    "discount_amount",
+    "discount_name",
+    "translated_discount_name",
+    "weight",
+    "private_metadata",
+    "metadata",
+)
 
-def generate_order_payload(order: "Order"):
-    serializer = PayloadSerializer()
-    fulfillment_fields = ("status", "tracking_number", "created")
-    payment_fields = (
-        "gateway"
-        "is_active"
-        "created"
-        "modified"
-        "charge_status"
-        "total"
-        "captured_amount"
-        "currency"
-        "billing_email"
-        "billing_first_name"
-        "billing_last_name"
-        "billing_company_name"
-        "billing_address_1"
-        "billing_address_2"
-        "billing_city"
-        "billing_city_area"
-        "billing_postal_code"
-        "billing_country_code"
-        "billing_country_area"
-    )
+
+def generate_order_lines_payload(lines: Iterable[OrderLine]):
     line_fields = (
         "product_name",
         "variant_name",
@@ -64,38 +68,69 @@ def generate_order_payload(order: "Order"):
         "unit_price_gross_amount",
         "tax_rate",
     )
-    shipping_method_fields = ("name", "type", "currency", "price_amount")
-    order_fields = (
-        "created",
-        "status",
-        "user_email",
-        "shipping_method_name",
-        "shipping_price_net_amount",
-        "shipping_price_gross_amount",
-        "total_net_amount",
-        "total_gross_amount",
-        "shipping_price_net_amount",
-        "shipping_price_gross_amount",
-        "discount_amount",
-        "discount_name",
-        "translated_discount_name",
-        "weight",
-        "private_meta",
-        "meta",
+    serializer = PayloadSerializer()
+    return serializer.serialize(
+        lines,
+        fields=line_fields,
+        extra_dict_data={
+            "total_price_net_amount": (lambda l: l.get_total().net.amount),
+            "total_price_gross_amount": (lambda l: l.get_total().gross.amount),
+        },
     )
+
+
+def generate_order_payload(order: "Order"):
+    serializer = PayloadSerializer()
+    fulfillment_fields = ("status", "tracking_number", "created")
+    payment_fields = (
+        "gateway",
+        "payment_method_type",
+        "cc_brand",
+        "is_active",
+        "created",
+        "modified",
+        "charge_status",
+        "total",
+        "captured_amount",
+        "currency",
+        "billing_email",
+        "billing_first_name",
+        "billing_last_name",
+        "billing_company_name",
+        "billing_address_1",
+        "billing_address_2",
+        "billing_city",
+        "billing_city_area",
+        "billing_postal_code",
+        "billing_country_code",
+        "billing_country_area",
+    )
+
+    shipping_method_fields = ("name", "type", "currency", "price_amount")
+    lines = order.lines.all()
     order_data = serializer.serialize(
         [order],
-        fields=order_fields,
+        fields=ORDER_FIELDS,
         additional_fields={
             "shipping_method": (lambda o: o.shipping_method, shipping_method_fields),
-            "lines": (lambda o: o.lines.all(), line_fields),
             "payments": (lambda o: o.payments.all(), payment_fields),
             "shipping_address": (lambda o: o.shipping_address, ADDRESS_FIELDS),
             "billing_address": (lambda o: o.billing_address, ADDRESS_FIELDS),
             "fulfillments": (lambda o: o.fulfillments.all(), fulfillment_fields),
         },
+        extra_dict_data={"lines": json.loads(generate_order_lines_payload(lines))},
     )
     return order_data
+
+
+def generate_invoice_payload(invoice: "Invoice"):
+    serializer = PayloadSerializer()
+    invoice_fields = ("id", "number", "external_url", "created")
+    return serializer.serialize(
+        [invoice],
+        fields=invoice_fields,
+        additional_fields={"order": (lambda i: i.order, ORDER_FIELDS)},
+    )
 
 
 def generate_checkout_payload(checkout: "Checkout"):
@@ -109,8 +144,8 @@ def generate_checkout_payload(checkout: "Checkout"):
         "currency",
         "discount_amount",
         "discount_name",
-        "private_meta",
-        "meta",
+        "private_metadata",
+        "metadata",
     )
     user_fields = ("email", "first_name", "last_name")
     shipping_method_fields = ("name", "type", "currency", "price_amount")
@@ -144,8 +179,8 @@ def generate_customer_payload(customer: "User"):
             "last_name",
             "is_active",
             "date_joined",
-            "private_meta",
-            "meta",
+            "private_metadata",
+            "metadata",
         ],
         additional_fields={
             "default_shipping_address": (
@@ -162,34 +197,32 @@ def generate_customer_payload(customer: "User"):
 
 
 def generate_product_payload(product: "Product"):
-    serializer = PayloadSerializer()
+    serializer = PayloadSerializer(
+        extra_model_fields={"ProductVariant": ("quantity", "quantity_allocated")}
+    )
 
     product_fields = (
         "name",
         "description_json",
         "currency",
-        "price_amount",
-        "minimal_variant_price_amount",
         "attributes",
         "updated_at",
         "charge_taxes",
         "weight",
         "publication_date",
         "is_published",
-        "private_meta",
-        "meta",
+        "private_metadata",
+        "metadata",
     )
     product_variant_fields = (
         "sku",
         "name",
         "currency",
-        "price_override_amount",
+        "price_amount",
         "track_inventory",
-        "quantity",
-        "quantity_allocated",
         "cost_price_amount",
-        "private_meta",
-        "meta",
+        "private_metadata",
+        "metadata",
     )
     product_payload = serializer.serialize(
         [product],
@@ -197,10 +230,59 @@ def generate_product_payload(product: "Product"):
         additional_fields={
             "category": (lambda p: p.category, ("name", "slug")),
             "collections": (lambda p: p.collections.all(), ("name", "slug")),
-            "variants": (lambda p: p.variants.all(), product_variant_fields),
+            "variants": (
+                lambda p: p.variants.annotate_quantities().all(),
+                product_variant_fields,
+            ),
         },
     )
     return product_payload
+
+
+def generate_fulfillment_lines_payload(fulfillment: Fulfillment):
+    serializer = PayloadSerializer()
+    lines = FulfillmentLine.objects.prefetch_related(
+        "order_line__variant__product__product_type"
+    ).filter(fulfillment=fulfillment)
+    line_fields = ("quantity",)
+    return serializer.serialize(
+        lines,
+        fields=line_fields,
+        extra_dict_data={
+            "weight": (lambda fl: fl.order_line.variant.get_weight().g),
+            "weight_unit": "gram",
+            "product_type": (
+                lambda fl: fl.order_line.variant.product.product_type.name
+            ),
+            "unit_price_gross": lambda fl: fl.order_line.unit_price_gross_amount,
+            "currency": (lambda fl: fl.order_line.currency),
+        },
+    )
+
+
+def generate_fulfillment_payload(fulfillment: Fulfillment):
+    serializer = PayloadSerializer()
+
+    # fulfillment fields to serialize
+    fulfillment_fields = ("status", "tracking_code", "order__user_email")
+    order_country = get_order_country(fulfillment.order)
+    fulfillment_line = fulfillment.lines.first()
+    if fulfillment_line and fulfillment_line.stock:
+        warehouse = fulfillment_line.stock.warehouse
+    else:
+        warehouse = Warehouse.objects.for_country(order_country).first()
+    fulfillment_data = serializer.serialize(
+        [fulfillment],
+        fields=fulfillment_fields,
+        additional_fields={
+            "warehouse_address": (lambda f: warehouse.address, ADDRESS_FIELDS),
+        },
+        extra_dict_data={
+            "order": json.loads(generate_order_payload(fulfillment.order))[0],
+            "lines": json.loads(generate_fulfillment_lines_payload(fulfillment)),
+        },
+    )
+    return fulfillment_data
 
 
 def _get_sample_object(qs: QuerySet):
@@ -234,23 +316,38 @@ def _generate_sample_order_payload(event_name):
         WebhookEventType.ORDER_UPDATED,
     ]:
         order = _get_sample_object(order_qs.filter(status=OrderStatus.CANCELED))
-    return generate_order_payload(order) if order else None
+    if order:
+        anonymized_order = anonymize_order(order)
+        return generate_order_payload(anonymized_order)
 
 
 def generate_sample_payload(event_name: str) -> Optional[dict]:
+    checkout_events = [
+        WebhookEventType.CHECKOUT_QUANTITY_CHANGED,
+        WebhookEventType.CHECKOUT_UPADTED,
+        WebhookEventType.CHECKOUT_CREATED,
+    ]
     if event_name == WebhookEventType.CUSTOMER_CREATED:
-        user = _get_sample_object(User.objects.filter(is_staff=False, is_active=True))
-        payload = generate_customer_payload(user) if user else None
+        user = generate_fake_user()
+        payload = generate_customer_payload(user)
     elif event_name == WebhookEventType.PRODUCT_CREATED:
         product = _get_sample_object(
             Product.objects.prefetch_related("category", "collections", "variants")
         )
         payload = generate_product_payload(product) if product else None
-    elif event_name == WebhookEventType.CHECKOUT_QUANTITY_CHANGED:
+    elif event_name in checkout_events:
         checkout = _get_sample_object(
             Checkout.objects.prefetch_related("lines__variant__product")
         )
-        payload = generate_checkout_payload(checkout) if checkout else None
+        if checkout:
+            anonymized_checkout = anonymize_checkout(checkout)
+            payload = generate_checkout_payload(anonymized_checkout)
+    elif event_name == WebhookEventType.FULFILLMENT_CREATED:
+        fulfillment = _get_sample_object(
+            Fulfillment.objects.prefetch_related("lines__order_line__variant")
+        )
+        fulfillment.order = anonymize_order(fulfillment.order)
+        payload = generate_fulfillment_payload(fulfillment)
     else:
         payload = _generate_sample_order_payload(event_name)
     return json.loads(payload) if payload else None
